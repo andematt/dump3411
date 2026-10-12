@@ -105,10 +105,13 @@ Edit any of those in the service file before installing.
 --wifi-iface IFACE   monitor-mode interface             (default: wlan1)
 --channel-dwell SEC  seconds per channel before hop     (default: 0.2)
 --channel CH         stay on one WiFi channel           (default: hop 1-11)
+--max-channel N      highest WiFi channel, 11-13        (default: 11)
 --serve HOST:PORT    serve /data/remoteid.json + /      (omit for journal-only)
 --ttl SECS           drop drones after N s of silence   (default: 60)
 --verbose            log every decoded message type
 ```
+
+Outside North America, Wi-Fi channels 12 and 13 are legal and a drone's own Wi-Fi (and its beacon Remote ID) can use them. `--max-channel 13` adds them to the hop. The adapter can only tune them when the kernel's regulatory domain allows, so set the Wi-Fi country first (`sudo iw reg set FR`, or the WLAN country in `raspi-config`; `iw reg get` shows the current one). If a channel is refused, dump3411 logs a warning and drops it from the hop rather than silently staying on 11.
 
 ## Status dashboard
 
