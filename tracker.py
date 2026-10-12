@@ -171,7 +171,14 @@ class Tracker:
 
     def __init__(self, ttl_seconds: float = 60.0,
                  on_change: Optional[Callable[[str, dict], None]] = None,
-                 on_expire: Optional[Callable[[str], None]] = None):
+                 on_expire: Optional[Callable[[str], None]] = None,
+                 *,
+                 clock: Callable[[], float] = time.monotonic,
+                 wall_clock: Callable[[], float] = time.time):
+        # Injectable so a test (or the dump3411-esp32 parity harness) can step
+        # time deterministically through TTL expiry instead of sleeping.
+        self._clock = clock
+        self._wall_clock = wall_clock
         self._lock = threading.Lock()
         self._drones: dict[str, DroneState] = {}    # uas_id -> state
         self._mac_to_uas: dict[str, str] = {}       # mac    -> uas_id
@@ -180,7 +187,7 @@ class Tracker:
         self._stop = threading.Event()
         # Per-source rolling stats for the /status dashboard endpoint.
         self._by_source: dict[str, dict] = {}       # rid_source -> {messages, last_seen}
-        self._boot_mono = time.monotonic()
+        self._boot_mono = self._clock()
         # Sink hooks. Fired inside the cache lock right after a successful
         # mutation, so they MUST be fast and non-blocking — `queue.put_nowait`
         # is the canonical pattern. See `MqttPublisher` for the reference
@@ -219,7 +226,7 @@ class Tracker:
                         id_type_raw: int, ua_type_raw: int,
                         rssi: Optional[float], rid_source: str) -> None:
         """Decoded a Basic ID (msg type 0x0) — creates the entry if new."""
-        now = time.monotonic()
+        now = self._clock()
         id_type = _ID_TYPE_STRINGS.get(id_type_raw, "unknown")
         ua_type = _UA_TYPE_STRINGS.get(ua_type_raw)             # None if unknown
         with self._lock:
@@ -247,7 +254,7 @@ class Tracker:
                         vspeed_mps: Optional[float],
                         rssi: Optional[float], rid_source: str) -> None:
         """Decoded a Location/Vector (0x1). Dropped if MAC isn't mapped yet."""
-        now = time.monotonic()
+        now = self._clock()
         with self._lock:
             state = self._drone_for_mac(mac)
             if state is None:
@@ -288,7 +295,7 @@ class Tracker:
         System messages, so without surfacing it downstream consumers can't
         tell a takeoff-point reading from a live operator fix.
         """
-        now = time.monotonic()
+        now = self._clock()
         with self._lock:
             state = self._drone_for_mac(mac)
             if state is None:
@@ -314,7 +321,7 @@ class Tracker:
         Empty descriptions are ignored — many transmitters emit a blank string
         before the operator configures one.
         """
-        now = time.monotonic()
+        now = self._clock()
         with self._lock:
             state = self._drone_for_mac(mac)
             if state is None:
@@ -337,7 +344,7 @@ class Tracker:
         Empty operator_id is ignored — many transmitters (and the spoofer)
         emit a blank string before the operator field is configured.
         """
-        now = time.monotonic()
+        now = self._clock()
         with self._lock:
             state = self._drone_for_mac(mac)
             if state is None:
@@ -377,8 +384,8 @@ class Tracker:
         here from the current monotonic time so the HTTP handler does zero
         work per-request beyond serialisation.
         """
-        now_mono = time.monotonic()
-        now_wall = time.time()
+        now_mono = self._clock()
+        now_wall = self._wall_clock()
         with self._lock:
             messages_total = self._messages_total
             drones = [self._row_for(s, now_mono) for s in self._drones.values()]
@@ -435,7 +442,7 @@ class Tracker:
         Lock-cheap: copies a few scalars + the small ``by_source`` dict and
         releases. The HTTP handler must do nothing else under request.
         """
-        now_mono = time.monotonic()
+        now_mono = self._clock()
         with self._lock:
             sources = {
                 src: {
@@ -472,7 +479,7 @@ class Tracker:
             self._sweep_once()
 
     def _sweep_once(self) -> None:
-        cutoff = time.monotonic() - self._ttl
+        cutoff = self._clock() - self._ttl
         with self._lock:
             stale = [uas for uas, s in self._drones.items() if s.last_seen < cutoff]
             for uas in stale:
@@ -559,4 +566,23 @@ if __name__ == "__main__":
     print(json.dumps(final, indent=2))
     assert final["drones"][0]["rid_source"] == "wifi_beacon"
     assert final["drones"][0]["rid_sources"] == ["wifi_beacon", "ble5", "ble"]
+
+    # Injected clock: step time by hand through `seen` and TTL eviction.
+    fake_now = [1000.0]
+    expired = []
+    c = Tracker(ttl_seconds=60.0, on_expire=expired.append,
+                clock=lambda: fake_now[0], wall_clock=lambda: 1_700_000_000.0)
+    c.update_basic_id(
+        mac="aa:bb:cc:dd:ee:02", uas_id="CLOCKTEST",
+        id_type_raw=1, ua_type_raw=2,
+        rssi=-70.0, rid_source="wifi_beacon",
+    )
+    fake_now[0] += 59.5
+    c._sweep_once()
+    snap = c.snapshot()
+    assert snap["now"] == 1_700_000_000.0
+    assert snap["drones"][0]["seen"] == 59.5
+    fake_now[0] += 1.0
+    c._sweep_once()
+    assert c.snapshot()["drones"] == [] and expired == ["CLOCKTEST"]
     print("smoke test OK")
