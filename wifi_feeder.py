@@ -627,19 +627,19 @@ class ChannelHopper(threading.Thread):
         self.iface    = iface
         self.channels = channels
         self.dwell    = dwell
-        self._stop    = threading.Event()
+        self._halt    = threading.Event()  # not _stop: that name shadows Thread._stop() and breaks join()
 
     def run(self):
         log.info(f"Channel hopper started: {self.channels} @ {self.dwell}s dwell")
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             for ch in self.channels:
-                if self._stop.is_set():
+                if self._halt.is_set():
                     break
                 set_channel(self.iface, ch)
                 time.sleep(self.dwell)
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
 
 
 # -- WiFi Detector -------------------------------------------------------------
