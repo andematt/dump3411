@@ -41,7 +41,7 @@ Use stdlib `http.server` — no async, no extra deps. dump3411 is designed to ru
 
 | Field | Type | Unit | Req | Source (decoder) |
 |---|---|---|:--:|---|
-| `id` | string | — | ✓ | Basic ID `uas_id` — the identity key |
+| `id` | string | — | ✓ | Basic ID `uas_id` — the identity key. For `wifi_beacon_fr`, the ANSI/CTA-2063 serial when the beacon carries one (`id_type` `serial`), otherwise the 30-character French ID (`id_type` `unknown`). |
 | `id_type` | string | — | ✓ | `serial` \| `caa_reg` \| `utm_uuid` \| `session` \| `unknown` (from `id_type`) |
 | `ua_type` | string | — |  | Basic ID `ua_type` |
 | `lat` / `lon` | number | deg |  | Location msg `latitude`/`longitude` |
@@ -54,7 +54,7 @@ Use stdlib `http.server` — no async, no extra deps. dump3411 is designed to ru
 | `message_count` | number | — |  | running count of decoded RID messages for this `id` since first seen (per-drone; distinct from the envelope `messages`) |
 | `seen` | number | s | ✓ | `now - last_seen[id]` |
 | `seen_pos` | number | s |  | `now - last_pos_seen[id]` |
-| `rid_source` | string | — |  | `ble` \| `ble5` \| `wifi_beacon` \| `wifi_nan` — `ble` = Bluetooth 4 legacy advertising (one 25-byte ODID message per advertisement); `ble5` = Bluetooth 5 long-range / extended advertising (a Message Pack per advertisement), classified from the wire structure — a pack cannot fit legacy advertising's 31-byte PDU cap — because BlueZ does not expose the PHY of received advertisements. |
+| `rid_source` | string | — |  | `ble` \| `ble5` \| `wifi_beacon` \| `wifi_beacon_fr` \| `wifi_nan` — `wifi_beacon_fr` = French Direct Remote ID beacon (see below); `ble` = Bluetooth 4 legacy advertising (one 25-byte ODID message per advertisement); `ble5` = Bluetooth 5 long-range / extended advertising (a Message Pack per advertisement), classified from the wire structure — a pack cannot fit legacy advertising's 31-byte PDU cap — because BlueZ does not expose the PHY of received advertisements. |
 | `rid_sources` | array of strings | — |  | **Every** transport this drone has been heard on since it entered the tracker, most-recent-first — e.g. `["wifi_beacon", "ble5", "ble"]`. Element 0 always matches the current `rid_source`. Values mirror `rid_source`. Resets when the drone TTL-evicts and reappears, same as `message_count`. |
 | `self_id` | string | — |  | Self-ID `description` — free-text purpose of flight (e.g. "Search and Rescue", "Photography Lesson") |
 | `self_id_seen` | number | s |  | `now - last_self_id_seen[id]` |
@@ -71,6 +71,14 @@ Use stdlib `http.server` — no async, no extra deps. dump3411 is designed to ru
 | `seen` | number | s | `now - last_operator_seen[id]` — staleness of this whole block |
 
 A detection with no `lat`/`lon` is valid (Basic ID heard before GPS lock). Keep it — the identity is known; position is just unavailable.
+
+### French Direct Remote ID (`wifi_beacon_fr`)
+
+France's national scheme (arrêté of 27 December 2019) is not OpenDroneID: it's a Wi-Fi beacon vendor element under OUI `6A:5C:35` with a TLV payload. Each beacon carries identity, position and takeoff point together, and fills the same fields as the ODID transports:
+
+- `id` / `id_type` as described above; `ua_type` is never set, because the format has no UA type.
+- `lat`, `lon`, `alt_geom_ft` (MSL), `agl_ft` (height above takeoff), `gs` and `track`. Positions have 1e-5° resolution (about 1 m), and altitude, height and speed are whole metres or m/s. There's no vertical rate, so `geom_rate` stays absent.
+- The takeoff point fills `operator.lat`/`lon` with `operator.location_type` = `takeoff`. The format has no live operator position.
 
 ---
 
