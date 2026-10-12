@@ -134,7 +134,7 @@ class DroneState:
     rid_source: Optional[str] = None
     # Every transport heard from since the drone entered the tracker,
     # most-recent-first. Values mirror `rid_source` ("ble" | "ble5" |
-    # "wifi_beacon" | "wifi_nan"). See _touch_sources().
+    # "wifi_beacon" | "wifi_beacon_fr" | "wifi_nan"). See _touch_sources().
     sources: list = dataclasses.field(default_factory=list)
 
     # Operator / System block — most-recent wins.

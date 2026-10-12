@@ -11,6 +11,7 @@ No network connection, no token, no data sharing.
 Supports:
   - Wi-Fi Beacon transport (vendor IE, OUI FA:0B:BC, type 0x0D)  [F3411-19/22a]
   - Wi-Fi NAN transport detection (action frames, OUI 50:6F:9A)  [F3411-22a]
+  - French Direct Remote ID beacons (vendor IE, OUI 6A:5C:35, type 0x01, TLV)
 
 Uses raw AF_PACKET sockets (stdlib only — no scapy dependency).
 
@@ -50,6 +51,11 @@ log = logging.getLogger("dump3411.wifi")
 # Vendor-specific IE OUI for ASTM F3411 Wi-Fi Beacon transport
 ASTM_OUI      = bytes([0xFA, 0x0B, 0xBC])
 ASTM_OUI_TYPE = 0x0D  # Remote ID app code
+
+# French Direct Remote ID ("signalement électronique", arrêté of 27 December
+# 2019). Its own vendor IE and a TLV payload, not ODID: see parse_frdid.
+FRDID_OUI      = bytes([0x6A, 0x5C, 0x35])
+FRDID_OUI_TYPE = 0x01
 
 # Wi-Fi Alliance NAN OUI (action frames)
 NAN_OUI      = bytes([0x50, 0x6F, 0x9A])
@@ -420,6 +426,98 @@ def _extract_beacon_rid(body: bytes) -> bytes | None:
     return None
 
 
+def _extract_beacon_frdid(body: bytes) -> bytes | None:
+    """
+    Walk beacon IEs for the French Direct Remote ID vendor IE (OUI 6A:5C:35,
+    type 0x01) and return its TLV payload. Unlike the ASTM element there is
+    no send counter: the TLVs start straight after OUI(3) + type(1).
+    """
+    offset = 12  # skip fixed parameters
+    while offset + 2 <= len(body):
+        tag_id  = body[offset]
+        tag_len = body[offset + 1]
+        end     = offset + 2 + tag_len
+        if end > len(body):
+            break
+        if tag_id == 221:
+            info = body[offset + 2: end]
+            if len(info) > 4 and info[:3] == FRDID_OUI and info[3] == FRDID_OUI_TYPE:
+                return info[4:]
+        offset = end
+    return None
+
+
+def parse_frdid(data: bytes) -> dict | None:
+    """
+    Decode a French Direct Remote ID TLV payload.
+
+    Each field is type(1) + length(1) + value, **big-endian** (ODID is
+    little-endian). Types, per opendroneid-core-c's frdid_build:
+
+      0x01  protocol version (uint8, 1)
+      0x02  French ID (30 ASCII bytes: maker trigram + model + serial)
+      0x03  ANSI/CTA-2063 serial number (ASCII, variable length)
+      0x04  latitude          (int32 × 1e-5°)
+      0x05  longitude         (int32 × 1e-5°)
+      0x06  altitude, MSL     (int16, m)
+      0x07  height above takeoff (int16, m)
+      0x08  takeoff latitude  (int32 × 1e-5°)
+      0x09  takeoff longitude (int32 × 1e-5°)
+      0x0A  horizontal speed  (uint8, m/s)
+      0x0B  true course       (uint16, degrees 0-359)
+
+    Senders omit fields they don't have, so every key is optional. Returns
+    None when a TLV overruns the payload or nothing identifies the drone,
+    since a beacon we can't attribute is no use to the tracker.
+    """
+    fields: dict[int, bytes] = {}
+    offset = 0
+    while offset < len(data):
+        if offset + 2 > len(data):
+            return None
+        t, n = data[offset], data[offset + 1]
+        if offset + 2 + n > len(data):
+            return None
+        fields[t] = data[offset + 2: offset + 2 + n]
+        offset += 2 + n
+
+    def text(t: int) -> str:
+        return fields.get(t, b"").split(b"\0", 1)[0].decode("ascii", errors="replace").strip()
+
+    def num(t: int, fmt: str):
+        v = fields.get(t)
+        return struct.unpack(fmt, v)[0] if v is not None and len(v) == struct.calcsize(fmt) else None
+
+    result: dict = {}
+    french_id, serial = text(0x02), text(0x03)
+    if french_id:
+        result["french_id"] = french_id
+    if serial:
+        result["serial"] = serial
+    if not result:
+        return None
+
+    lat, lon = num(0x04, ">i"), num(0x05, ">i")
+    if lat is not None and lon is not None and abs(lat) <= 9_000_000 and abs(lon) <= 18_000_000:
+        result["latitude"]  = round(lat * 1e-5, 5)
+        result["longitude"] = round(lon * 1e-5, 5)
+    alt, height = num(0x06, ">h"), num(0x07, ">h")
+    if alt is not None:
+        result["altitude_geo"] = float(alt)
+    if height is not None:
+        result["height_agl"] = float(height)
+    speed, course = num(0x0A, ">B"), num(0x0B, ">H")
+    if speed is not None:
+        result["ground_speed"] = float(speed)
+    if course is not None and course < 360:
+        result["heading"] = float(course)
+    to_lat, to_lon = num(0x08, ">i"), num(0x09, ">i")
+    if to_lat is not None and to_lon is not None and abs(to_lat) <= 9_000_000 and abs(to_lon) <= 18_000_000:
+        result["takeoff_lat"] = round(to_lat * 1e-5, 5)
+        result["takeoff_lon"] = round(to_lon * 1e-5, 5)
+    return result
+
+
 def _is_nan_action(body: bytes) -> bool:
     """
     Detect Wi-Fi NAN action frames carrying ODID (ASTM F3411-22a).
@@ -686,6 +784,7 @@ class WiFiFeeder:
             ChannelHopper(iface, channels_up_to(max_channel), channel_dwell)
         self.count     = 0
         self.nan_count = 0
+        self.fr_count  = 0
         self._stop     = threading.Event()  # for orderly shutdown from another thread
 
     def _on_packet(self, data: bytes):
@@ -705,6 +804,9 @@ class WiFiFeeder:
         if subtype == 8:
             rid_payload = _extract_beacon_rid(body)
             if rid_payload is None:
+                frdid = _extract_beacon_frdid(body)
+                if frdid is not None:
+                    self._on_frdid(addr2, frdid, rssi)
                 return
 
             decoded = decode_rid_message(rid_payload)
@@ -816,6 +918,52 @@ class WiFiFeeder:
                         f"Type={mtype}  {detail}"
                     )
 
+    def _on_frdid(self, mac: str, payload: bytes, rssi) -> None:
+        """Handle a French Direct Remote ID beacon.
+
+        One beacon carries identity, position and takeoff point together, so
+        it's split into the ODID-shaped Basic ID / Location / System dicts
+        _update_tracker already routes. Basic ID goes first so the MAC →
+        uas_id mapping exists for the rest. The takeoff point fills the
+        operator block as location type ``takeoff``, the same convention as
+        an ODID System message that reports takeoff rather than a live fix.
+        """
+        fr = parse_frdid(payload)
+        if fr is None:
+            log.debug(f"[WiFi-FR] MAC={mac}  unparseable TLV payload: {payload.hex()}")
+            return
+        self.fr_count += 1
+
+        # Prefer the ANSI/CTA-2063 serial: it's the same identifier an ODID
+        # Basic ID would carry, so it lines up with FAA lookups and other
+        # receivers. The French ID is the fallback.
+        serial = fr.get("serial")
+        messages = [("Basic ID", {
+            "uas_id":      serial or fr["french_id"],
+            "id_type_raw": 1 if serial else 0,
+            # No UA type in the format. None leaves it unset, where 0 would
+            # write "none" and block a later ODID Basic ID from filling it.
+            "ua_type_raw": None,
+        })]
+        if "latitude" in fr:
+            messages.append(("Location/Vector", fr))
+        if "takeoff_lat" in fr:
+            messages.append(("System", {
+                "operator_lat":           fr["takeoff_lat"],
+                "operator_lon":           fr["takeoff_lon"],
+                "operator_location_type": "takeoff",
+            }))
+
+        if self.tracker is not None:
+            for mtype, msg in messages:
+                self._update_tracker(mac, mtype, msg, rssi, rid_source="wifi_beacon_fr")
+
+        position = f"lat={fr['latitude']} lon={fr['longitude']}" if "latitude" in fr else "no position"
+        log.info(
+            f"[WiFi-FR] MAC={mac}  RSSI={rssi}dBm  "
+            f"UAS-ID={messages[0][1]['uas_id']}  {position}"
+        )
+
     def _update_tracker(self, mac: str, mtype: str, msg: dict, rssi,
                         rid_source: str = "wifi_beacon") -> None:
         """Route a decoded sub-message to the appropriate Tracker.update_*.
@@ -864,7 +1012,7 @@ class WiFiFeeder:
     def _heartbeat_loop(self):
         while True:
             time.sleep(60)
-            log.info(f"[Heartbeat] Beacon RID={self.count}  NAN={self.nan_count}")
+            log.info(f"[Heartbeat] Beacon RID={self.count}  NAN={self.nan_count}  FR={self.fr_count}")
 
     def stop(self) -> None:
         """Signal run() to exit; restore_managed_mode() runs in the finally."""
@@ -905,7 +1053,7 @@ class WiFiFeeder:
             if self.hopper is not None:
                 self.hopper.stop()
             restore_managed_mode(self.iface)
-            log.info(f"[Summary] Beacon RID={self.count}  NAN frames={self.nan_count}")
+            log.info(f"[Summary] Beacon RID={self.count}  NAN frames={self.nan_count}  FR beacons={self.fr_count}")
 
 
 def _handle_sigterm(signum, frame):
