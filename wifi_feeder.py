@@ -63,6 +63,18 @@ ODID_NAN_SERVICE_ID = hashlib.sha256(b"org.opendroneid.remoteid").digest()[:6]
 # 2.4 GHz channels (RT3070 is 2.4 GHz only)
 CHANNELS_24 = list(range(1, 12))  # 1-11 (US band)
 
+# Channels 12-13 are legal in most of the world outside North America
+# (Europe, Japan, much of Asia), so a drone's own Wi-Fi, and its beacon
+# Remote ID with it, can sit there. Opt-in via --max-channel because the
+# adapter can only tune them when the kernel's regulatory domain allows.
+# Channel 14 (Japan, 802.11b only) is left out: drones don't use it.
+MAX_CHANNEL_CHOICES = (11, 12, 13)
+
+
+def channels_up_to(max_channel: int) -> list[int]:
+    """2.4 GHz hop list 1..max_channel."""
+    return list(range(1, max_channel + 1))
+
 MSG_TYPE = {
     0x0: "Basic ID",
     0x1: "Location/Vector",
@@ -609,12 +621,24 @@ def restore_managed_mode(iface: str):
         log.warning(f"Could not restore managed mode: {e}")
 
 
-def set_channel(iface: str, channel: int):
-    """Set the monitor interface to a specific 2.4 GHz channel."""
-    subprocess.run(
+def set_channel(iface: str, channel: int) -> bool:
+    """Set the monitor interface to a specific 2.4 GHz channel.
+
+    Returns False if iw refused, e.g. channel 12-13 under a regulatory domain
+    that doesn't allow them. The adapter then stays on its previous channel.
+    """
+    r = subprocess.run(
         ["iw", "dev", iface, "set", "channel", str(channel)],
-        check=False, capture_output=True,
+        check=False, capture_output=True, text=True,
     )
+    if r.returncode != 0:
+        log.debug(f"iw set channel {channel} failed: {r.stderr.strip()}")
+    return r.returncode == 0
+
+
+REGDOM_HINT = ("the regulatory domain probably doesn't allow it; check `iw reg get` "
+               "and set the Wi-Fi country, e.g. `sudo iw reg set FR` or the WLAN "
+               "country in raspi-config")
 
 
 # -- Channel Hopper ------------------------------------------------------------
@@ -632,10 +656,16 @@ class ChannelHopper(threading.Thread):
     def run(self):
         log.info(f"Channel hopper started: {self.channels} @ {self.dwell}s dwell")
         while not self._halt.is_set():
-            for ch in self.channels:
+            for ch in list(self.channels):
                 if self._halt.is_set():
                     break
-                set_channel(self.iface, ch)
+                if not set_channel(self.iface, ch) and ch > CHANNELS_24[-1]:
+                    # Without this the hop would silently dwell twice as long
+                    # on channel 11 and look like 12-13 were covered.
+                    log.warning(f"Channel {ch} rejected by {self.iface}; dropping it "
+                                f"from the hop list: {REGDOM_HINT}")
+                    self.channels.remove(ch)
+                    continue
                 time.sleep(self.dwell)
 
     def stop(self):
@@ -646,13 +676,14 @@ class ChannelHopper(threading.Thread):
 
 class WiFiFeeder:
     def __init__(self, iface: str, verbose: bool = False, channel_dwell: float = 0.2,
-                 channel: int | None = None, tracker: "Tracker | None" = None):
+                 channel: int | None = None, tracker: "Tracker | None" = None,
+                 max_channel: int = CHANNELS_24[-1]):
         self.iface     = iface
         self.verbose   = verbose
         self.tracker   = tracker      # optional; when set, decoded messages also feed it
-        self.channel   = channel      # fixed channel; None = hop CHANNELS_24
+        self.channel   = channel      # fixed channel; None = hop 1..max_channel
         self.hopper    = None if channel is not None else \
-            ChannelHopper(iface, CHANNELS_24, channel_dwell)
+            ChannelHopper(iface, channels_up_to(max_channel), channel_dwell)
         self.count     = 0
         self.nan_count = 0
         self._stop     = threading.Event()  # for orderly shutdown from another thread
@@ -844,11 +875,13 @@ class WiFiFeeder:
 
         set_monitor_mode(self.iface)
         if self.hopper is not None:
-            log.info(f"Channels: {CHANNELS_24}")
+            log.info(f"Channels: {self.hopper.channels}")
             self.hopper.start()
         else:
             log.info(f"Fixed channel: {self.channel} (hopping disabled)")
-            set_channel(self.iface, self.channel)
+            if not set_channel(self.iface, self.channel):
+                hint = f": {REGDOM_HINT}" if self.channel > CHANNELS_24[-1] else ""
+                log.error(f"Could not tune {self.iface} to channel {self.channel}{hint}")
 
         log.info("Scanning for Remote ID beacon frames (ASTM F3411)...")
 
@@ -894,7 +927,12 @@ def main():
     )
     parser.add_argument(
         "--channel", type=int, default=None, metavar="CH",
-        help="Stay on a single fixed channel (1-11) instead of hopping"
+        help="Stay on a single fixed channel (1 to --max-channel) instead of hopping"
+    )
+    parser.add_argument(
+        "--max-channel", type=int, default=CHANNELS_24[-1], choices=MAX_CHANNEL_CHOICES,
+        help="Highest 2.4 GHz channel to use (default: 11). 12-13 are legal outside "
+             "North America and need a matching regulatory domain."
     )
     parser.add_argument(
         "--verbose", "-v", action="store_true",
@@ -902,8 +940,8 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.channel is not None and args.channel not in CHANNELS_24:
-        parser.error(f"--channel must be {CHANNELS_24[0]}-{CHANNELS_24[-1]}")
+    if args.channel is not None and not 1 <= args.channel <= args.max_channel:
+        parser.error(f"--channel must be 1-{args.max_channel} (raise --max-channel for 12-13)")
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
 
@@ -912,6 +950,7 @@ def main():
         verbose=args.verbose,
         channel_dwell=args.channel_dwell,
         channel=args.channel,
+        max_channel=args.max_channel,
     )
     feeder.run()
 

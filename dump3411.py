@@ -30,7 +30,7 @@ from typing import Tuple
 import feed_server
 from ble_feeder import BLEFeeder
 from tracker import Tracker
-from wifi_feeder import CHANNELS_24, WiFiFeeder
+from wifi_feeder import CHANNELS_24, MAX_CHANNEL_CHOICES, WiFiFeeder
 
 # Logging is configured (root) by the feeder modules at import time; reuse it.
 log = logging.getLogger("dump3411.main")
@@ -65,8 +65,13 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--channel", type=int, default=None, metavar="CH",
-        help="Stay on a single fixed WiFi channel (1-11) instead of hopping "
-             "(default: hop 1-11)",
+        help="Stay on a single fixed WiFi channel (1 to --max-channel) instead "
+             "of hopping (default: hop 1 to --max-channel)",
+    )
+    p.add_argument(
+        "--max-channel", type=int, default=CHANNELS_24[-1], choices=MAX_CHANNEL_CHOICES,
+        help="Highest 2.4 GHz WiFi channel to use (default: 11). 12-13 are legal "
+             "outside North America and need a matching regulatory domain.",
     )
     p.add_argument(
         "--serve", default=None, metavar="HOST:PORT",
@@ -138,8 +143,8 @@ def _parse_args() -> argparse.Namespace:
              "Also read from $HISTORY_RECENT_DAYS.",
     )
     args = p.parse_args()
-    if args.channel is not None and args.channel not in CHANNELS_24:
-        p.error(f"--channel must be {CHANNELS_24[0]}-{CHANNELS_24[-1]}")
+    if args.channel is not None and not 1 <= args.channel <= args.max_channel:
+        p.error(f"--channel must be 1-{args.max_channel} (raise --max-channel for 12-13)")
     return args
 
 
@@ -219,7 +224,7 @@ def main() -> None:
                      tracker=tracker)
     wifi = WiFiFeeder(iface=args.wifi_iface, verbose=args.verbose,
                       channel_dwell=args.channel_dwell, channel=args.channel,
-                      tracker=tracker)
+                      max_channel=args.max_channel, tracker=tracker)
 
     # Daemon threads: radios produce, sweeper expires stale entries.
     threading.Thread(target=lambda: asyncio.run(ble.run()),
