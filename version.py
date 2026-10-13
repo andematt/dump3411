@@ -35,25 +35,35 @@ def get_version() -> str:
     return "unknown"
 
 
-def _from_git() -> str | None:
-    if not (_ROOT / ".git").exists():
-        return None
-    result = subprocess.run(
-        [
-            "git",
-            "-c", f"safe.directory={_ROOT}",
-            "describe", "--tags", "--always", "--dirty",
-        ],
+def _git(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "--no-optional-locks", "-c", f"safe.directory={_ROOT}", *args],
         cwd=_ROOT,
         check=False,
         capture_output=True,
         text=True,
         timeout=5,
     )
+
+
+def _from_git() -> str | None:
+    if not (_ROOT / ".git").exists():
+        return None
+    # Not `describe --dirty`: it refreshes and rewrites .git/index whenever
+    # file stat info is stale (normal right after a pull), even with optional
+    # locks off. The service runs as root, so that would leave a root-owned
+    # index in the user's checkout on every start. `status` with optional
+    # locks off answers the same question without writing.
+    result = _git("describe", "--tags", "--always")
     if result.returncode != 0:
         return None
     value = result.stdout.strip()
-    return value or None
+    if not value:
+        return None
+    status = _git("status", "--porcelain", "--untracked-files=no")
+    if status.returncode == 0 and status.stdout.strip():
+        value += "-dirty"
+    return value
 
 
 def _is_unexpanded(value: str) -> bool:
@@ -139,5 +149,35 @@ if __name__ == "__main__":
         d = base / "bare"; d.mkdir()
         shutil.copy(__file__, d / "version.py")
         assert _load(d) == "unknown"
+
+        # Real checkout: clean vs dirty, and the index is never rewritten
+        # (the service runs as root against a user-owned checkout).
+        if shutil.which("git"):
+            import os
+            import subprocess as sp
+
+            g = base / "repo"; g.mkdir()
+            shutil.copy(__file__, g / "version.py")
+            env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+            def git(*a):
+                sp.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                        "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", *a],
+                       cwd=g, check=True, capture_output=True, env=env)
+
+            git("init", "-q"); git("add", "version.py"); git("commit", "-q", "-m", "x")
+            git("tag", "v0.0.1")
+            assert _load(g) == "v0.0.1", _load(g)
+
+            index = g / ".git" / "index"
+            os.utime(index, (1, 1))                        # stale stat info, as after a pull
+            os.utime(g / "version.py")
+            assert _load(g) == "v0.0.1"
+            assert index.stat().st_mtime == 1, "describe/status rewrote .git/index"
+
+            with open(g / "version.py", "a") as f:
+                f.write("\n# local edit\n")
+            assert _load(g) == "v0.0.1-dirty", _load(g)
+            assert index.stat().st_mtime == 1, "describe/status rewrote .git/index"
 
     print("smoke test OK")
