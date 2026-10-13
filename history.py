@@ -132,6 +132,13 @@ class HistoryWriter:
 
         self._write_lock = threading.Lock()
         self._last_write: dict[str, float] = {}   # uas_id -> monotonic
+
+        # stats() feeds /status, which the dashboard polls every 1.5 s, but its
+        # COUNT queries scan the table: about 1 s per call on a Pi Zero at 240k
+        # rows. A minute-old row count is fine for a status tile.
+        self._stats_lock = threading.Lock()
+        self._stats_cache: Optional[dict] = None
+        self._stats_at = float("-inf")             # monotonic
         self._stop = threading.Event()
         self._cleanup_thread: Optional[threading.Thread] = None
 
@@ -343,8 +350,22 @@ class HistoryWriter:
         finally:
             c.close()
 
+    STATS_TTL_S = 60.0
+
     def stats(self) -> dict:
-        """For /status: rows, distinct drones, file size."""
+        """For /status: rows, distinct drones, file size. Cached for STATS_TTL_S.
+
+        The lock also makes concurrent /status requests wait for one refresh
+        rather than each running the scans.
+        """
+        with self._stats_lock:
+            now = time.monotonic()
+            if self._stats_cache is None or now - self._stats_at >= self.STATS_TTL_S:
+                self._stats_cache = self._compute_stats()
+                self._stats_at = now
+            return dict(self._stats_cache)
+
+    def _compute_stats(self) -> dict:
         try:
             size_bytes = os.path.getsize(self._path)
         except OSError:
@@ -354,9 +375,10 @@ class HistoryWriter:
             (rows,) = c.execute("SELECT COUNT(*) FROM detections").fetchone()
             (drones,) = c.execute(
                 "SELECT COUNT(DISTINCT uas_id) FROM detections").fetchone()
-            row = c.execute(
-                "SELECT MIN(ts), MAX(ts) FROM detections").fetchone()
-            earliest, latest = row[0], row[1]
+            # Separate queries: SQLite answers a lone MIN() or MAX() from
+            # idx_ts in O(log n), but MIN(ts), MAX(ts) together is a full scan.
+            (earliest,) = c.execute("SELECT MIN(ts) FROM detections").fetchone()
+            (latest,) = c.execute("SELECT MAX(ts) FROM detections").fetchone()
         finally:
             c.close()
         return {
