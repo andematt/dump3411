@@ -370,8 +370,12 @@ async function tick() {
 
 document.getElementById('hostname').textContent = location.host;
 syncUnitButtons();
-tick();
-setInterval(tick, 1500);
+// Chain rather than setInterval: on a slow host a /status that takes longer
+// than the interval would otherwise start overlapping requests that pile up.
+(async function poll() {
+  await tick();
+  setTimeout(poll, 1500);
+})();
 </script>
 </body>
 </html>
