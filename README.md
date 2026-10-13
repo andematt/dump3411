@@ -58,6 +58,12 @@ When a Remote-ID-compliant drone broadcasts in range, the journal logs each deco
 [WiFi-NAN]      MAC=...  RSSI=-68dBm  Type=Basic ID         UAS-ID=...
 ```
 
+France's national Direct Remote ID beacons (vendor element `6A:5C:35`, a TLV format that isn't ASTM F3411) are decoded too. Each beacon carries the identity and position in one line:
+
+```
+[WiFi-FR]       MAC=...  RSSI=-70dBm  UAS-ID=1581F...  lat=48.85837 lon=2.29448
+```
+
 The dashboard at `http://<host>:8754/` shows a live status pill, per-transport message counters, CPU temperature, and a table of currently tracked drones with clickable Google Maps links for both the drone position and the operator location. A header toggle switches the display between imperial (`ft·kt·°F`) and metric (`m·m/s·°C`); the wire feed stays imperial regardless.
 
 If nothing's in range, the dashboard sits at IDLE and the journal stays quiet. That's expected — Remote ID is only broadcast by drones registered after September 2023, so coverage is sparse. See **[TESTING.md](./TESTING.md)** for how to put a transmitter on the air and confirm the whole path works.
@@ -105,10 +111,13 @@ Edit any of those in the service file before installing.
 --wifi-iface IFACE   monitor-mode interface             (default: wlan1)
 --channel-dwell SEC  seconds per channel before hop     (default: 0.2)
 --channel CH         stay on one WiFi channel           (default: hop 1-11)
+--max-channel N      highest WiFi channel, 11-13        (default: 11)
 --serve HOST:PORT    serve /data/remoteid.json + /      (omit for journal-only)
 --ttl SECS           drop drones after N s of silence   (default: 60)
 --verbose            log every decoded message type
 ```
+
+Outside North America, Wi-Fi channels 12 and 13 are legal and a drone's own Wi-Fi (and its beacon Remote ID) can use them. `--max-channel 13` adds them to the hop. The adapter can only tune them when the kernel's regulatory domain allows, so set the Wi-Fi country first (`sudo iw reg set FR`, or the WLAN country in `raspi-config`; `iw reg get` shows the current one). If a channel is refused, dump3411 logs a warning and drops it from the hop rather than silently staying on 11.
 
 ## Status dashboard
 

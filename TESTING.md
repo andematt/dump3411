@@ -67,3 +67,7 @@ The official OpenDroneID Linux transmitter. Written in C, supports BLE + Wi-Fi, 
 → **[github.com/ArduPilot/ArduRemoteID](https://github.com/ArduPilot/ArduRemoteID)**
 
 Pre-built firmware for the ESP32-S3. Flash with the Espressif flash tool, plug in power, and it's a standalone Remote ID beacon you can leave on the bench. ~$10–15 of hardware, fully spec-compliant.
+
+## 4. Decoder tests from reference-encoder frames
+
+`python3 tests/test_frdid.py` (or `pytest tests/`) checks French Direct Remote ID beacon decoding, end to end through the Wi-Fi packet handler and the tracker, against frames built by opendroneid-core-c's own French encoder. None of the three tools above transmit that format. `tests/gen_frdid.c` regenerates the frames; build instructions are at the top of the file.
