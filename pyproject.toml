@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name            = "dump3411"
-version         = "1.0.0"
+version         = "1.1.0"
 description     = "Local-only Remote ID drone detector for Linux (BLE + Wi-Fi Beacon + Wi-Fi NAN, per ASTM F3411)"
 readme          = "README.md"
 license         = { file = "LICENSE" }
