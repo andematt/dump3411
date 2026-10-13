@@ -593,6 +593,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return body, "application/json"
         if bare == "/status":
             doc = self.tracker.health()
+            # Process-level, not tracker state: kept out of Tracker so it stays
+            # free of git subprocesses (the esp32 parity harness loads it alone).
+            doc["version"] = get_version()
             doc["history_enabled"] = self.history is not None
             if self.history is not None:
                 try:
