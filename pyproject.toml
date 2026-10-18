@@ -70,6 +70,7 @@ py-modules = [
     "wifi_feeder",
     "scan_plan",
     "mqtt_publisher",
+    "ha_setup",
     "history",
     "version",
 ]

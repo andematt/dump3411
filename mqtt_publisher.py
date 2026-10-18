@@ -77,6 +77,68 @@ def _make_client(client_id: str):
     return mqtt.Client(client_id=client_id, clean_session=True)
 
 
+def discovery_enabled() -> bool:
+    """Home Assistant MQTT discovery is on unless MQTT_DISCOVERY is false/0/off."""
+    raw = os.environ.get("MQTT_DISCOVERY", "true").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def discovery_configs(prefix: str = "dump3411",
+                      discovery_prefix: str = "homeassistant",
+                      hostname: str | None = None) -> list[tuple[str, dict]]:
+    """Retained MQTT discovery documents for the topics this process publishes.
+
+    Home Assistant creates entities from these. They are not the detection
+    rows. Republishing them is what brings the device back after a broker
+    loses its retained messages. Unique ids match the configs first published
+    for this node so a re-run updates the same entities.
+    """
+    prefix = prefix.strip("/") or "dump3411"
+    discovery_prefix = discovery_prefix.strip("/") or "homeassistant"
+    host = hostname or os.uname().nodename
+    device = {
+        "identifiers": [f"{prefix}-{host}"],
+        "name": prefix,
+        "model": "dump3411",
+        "manufacturer": "dump3411",
+    }
+    node = prefix
+    specs = [
+        ("binary_sensor", "online", {
+            "name": "Online",
+            "state_topic": f"{prefix}/online",
+            "payload_on": "online",
+            "payload_off": "offline",
+            "unique_id": f"{prefix}_online",
+        }),
+        ("sensor", "drones_active", {
+            "name": "Drones active",
+            "state_topic": f"{prefix}/status",
+            "value_template": "{{ value_json.drones_active }}",
+            "unique_id": f"{prefix}_drones_active",
+        }),
+        ("sensor", "messages", {
+            "name": "Messages",
+            "state_topic": f"{prefix}/status",
+            "value_template": "{{ value_json.messages_total }}",
+            "unique_id": f"{prefix}_messages_total",
+        }),
+        ("sensor", "last_detection", {
+            "name": "Last detection",
+            "state_topic": f"{prefix}/events/detection",
+            "value_template": "{{ value_json.uas_id }}",
+            "json_attributes_topic": f"{prefix}/events/detection",
+            "unique_id": f"{prefix}_last_detection",
+        }),
+    ]
+    out = []
+    for component, object_id, body in specs:
+        body["device"] = device
+        topic = f"{discovery_prefix}/{component}/{node}/{object_id}/config"
+        out.append((topic, body))
+    return out
+
+
 def _safe_topic_segment(s: str) -> str:
     """Sanitise a string for use as an MQTT topic level.
 
@@ -121,6 +183,11 @@ class MqttPublisher:
         self._t_status = f"{self._prefix}/status"
         self._t_drones = f"{self._prefix}/drones"
         self._t_event  = f"{self._prefix}/events/detection"
+        self._discovery = discovery_enabled()
+        self._discovery_prefix = (
+            os.environ.get("MQTT_DISCOVERY_PREFIX", "homeassistant").strip("/")
+            or "homeassistant"
+        )
 
         client_id = client_id or f"dump3411-{os.uname().nodename}"
         self._client = _make_client(client_id)
@@ -302,5 +369,22 @@ class MqttPublisher:
         if rc == 0:
             log.info("MQTT connected to %s:%d", self._host, self._port)
             client.publish(self._t_online, payload="online", qos=1, retain=True)
+            self._publish_discovery(client)
         else:
             log.warning("MQTT connect returned rc=%d", rc)
+
+    def _publish_discovery(self, client) -> None:
+        """Republish retained Home Assistant discovery. No-op when disabled."""
+        if not self._discovery:
+            return
+        configs = discovery_configs(self._prefix, self._discovery_prefix)
+        for topic, body in configs:
+            client.publish(
+                topic,
+                payload=json.dumps(body, separators=(",", ":")),
+                qos=1, retain=True,
+            )
+        log.info(
+            "published %d Home Assistant discovery configs under %s/",
+            len(configs), self._discovery_prefix,
+        )

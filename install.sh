@@ -137,12 +137,18 @@ echo "JSON feed : http://${LAN_IP}:8754/data/remoteid.json"
 echo "Live tail : sudo journalctl -u dump3411 -f"
 echo
 
-if [[ "$INSTALLED_MQTT" == "1" ]]; then
+if [[ -f /etc/dump3411.env ]]; then
+    echo "MQTT env file found — publishing Home Assistant discovery..."
+    python3 "$SCRIPT_DIR/ha_setup.py" --env-file /etc/dump3411.env || \
+        echo "      ha_setup.py failed — the service still republishes discovery on connect."
+    echo
+elif [[ "$INSTALLED_MQTT" == "1" ]]; then
     echo "MQTT is installed — to enable publishing, create /etc/dump3411.env with:"
     echo "    MQTT_BROKER=mqtt.lan:1883"
     echo "    MQTT_USER=dump3411"
     echo "    MQTT_PASSWORD=…"
     echo "Then: sudo systemctl restart dump3411"
+    echo "      sudo python3 $SCRIPT_DIR/ha_setup.py"
     echo
 fi
 

@@ -188,6 +188,8 @@ MQTT_PASSWORD=<your-password>
 
 Then `sudo systemctl restart dump3411`. The same flags work on the CLI for manual runs: `--mqtt-broker`, `--mqtt-topic-prefix`, `--mqtt-user`, `--mqtt-password`.
 
+On every connect the publisher also writes retained Home Assistant MQTT discovery configs (`homeassistant/sensor/dump3411/.../config` and the online binary sensor). That is what creates the entities. Set `MQTT_DISCOVERY=false` to skip it. `sudo python3 ha_setup.py` publishes the same configs without restarting the detector, and without touching `dump3411/online`. It reads `/etc/dump3411.env`. It does not create the broker user.
+
 Topic layout (under the configured prefix, default `dump3411`):
 
 | Topic | QoS | Retained | Content |
