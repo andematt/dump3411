@@ -286,7 +286,7 @@ On low-powered single-board hosts a powered USB hub is strongly recommended — 
 
 A monitor radio hears one channel at a time. Compliant aircraft beacon on channel 6 or 149 about once a second, and may transmit anywhere else only by going to at least 5 Hz, so the sweep sits on 6 and 149 and spends one second on each other channel. The 5 GHz list is 21 channels (149, 153–165, and the DFS channels 52–144). U-NII-1 is left out: it is indoor and low power, and a compliant beacon stays on 149 no matter where the video link is.
 
-| Radios | What they do | Time to cover every 5 GHz channel |
+| Radios | What they do | 5 GHz sweep |
 |---|---|---|
 | 1 dual-band | Channel 6 most of the time, channel 149 every cycle, one other channel per cycle | ~2.5 min |
 | 2 (one on 2.4, one sweeping 5) | The 2.4 radio owns channel 6; the other walks all 21 | **~21 s** |
@@ -294,9 +294,9 @@ A monitor radio hears one channel at a time. Compliant aircraft beacon on channe
 | 4 | Three-way split of 5 GHz | ~7 s |
 | 5 | Four-way split | ~6 s |
 
-Those times assume a fast retune, about 20 ms, and the 1 second dwell. They are estimates; the process measures the retune at startup and logs the cycle that radio will actually run. A slow adapter (a second per channel change) spends most of the sweep deaf, and no amount of planning fixes that.
+Two ACS adapters were measured at about 22 ms per retune, which is the ~21 s row. One radio, and three or more, are estimates only. Those configurations remain untested. The figures assume a ~20 ms retune and a 1 s dwell. The startup log prints the cycle the plugged-in radios actually run.
 
-A third adapter does help. It is the difference between a 21-second hole and an 11-second one, and it keeps scanning its half of 5 GHz while the other radio is holding a detection. A fourth still helps. A fifth barely does: the dwell itself is a second, and you cannot visit a channel in less time than you are willing to listen. Past two or three ACS adapters the limit is usually the host, not the plan — USB current, one shared USB bus, and Python reading every management frame. A Pi Zero is already busy with one adapter. A Pi 4 or 5 with a powered hub is the machine for three or four.
+On paper a third adapter cuts the 5 GHz hole from ~21 s to ~11 s, and keeps sweeping its half while the other radio holds a detection. A fourth still helps. A fifth barely does: the dwell itself is a second. Past two adapters the limit is usually the host — USB current, one shared bus, and Python reading every management frame — not the plan. A Pi 4 or 5 with a powered hub is the machine to try three or four on. That has not been done yet.
 
 A 2.4-only spare is not given 5 GHz work it cannot do. It sweeps the other 2.4 channels while its partner sits on channel 6. Further 2.4-only cards are left idle; that band is already small.
 
