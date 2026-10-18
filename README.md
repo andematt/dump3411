@@ -4,48 +4,242 @@ A local-only Remote ID detector for Linux. Picks up the mandatory drone identifi
 
 Spiritual sibling of [dump1090](https://github.com/flightaware/dump1090) (ADS-B at 1090 MHz) and dump978 (UAT at 978 MHz). The `3411` is the ASTM standard number — Remote ID isn't tied to a single frequency the way ADS-B or UAT are, so a spec number is the more honest identifier.
 
-## Quickstart
+## Set up a fresh Pi
 
-You'll need a Linux host with Python 3.10+, a Bluetooth adapter (built-in or USB), and a USB Wi-Fi adapter that supports monitor mode. A 2.4 GHz card (Alfa AWUS036NEH, RT3070) sees the 2.4 GHz beacons. A dual-band card — Alfa AWUS036ACS (RTL8811AU) is the fast one — also sees 5 GHz. Two of those, one on each band, is the setup this sweep is built for.
+This is the path that reproduces the running node: a newly flashed Raspberry Pi, USB monitor-mode adapters, the service starting on boot, and — if you want it — Home Assistant. Upstream `ifnull/dump3411` `main` does not have the dual-adapter sweep. Clone this fork's `feat/dual-adapter-scan` branch.
+
+Confirmed on a Raspberry Pi 4 (3 GB) running Raspberry Pi OS Trixie, with two Alfa AWUS036ACS adapters and the Pi's built-in Wi-Fi used only for SSH.
+
+### 1. Flash the card
+
+Use Raspberry Pi Imager. Install **Raspberry Pi OS Lite (64-bit)**. That image is Trixie. Bookworm's kernel does not ship `rtw88_8821au`, so an AWUS036ACS shows up in `lsusb` and never gets an interface.
+
+In Imager's customisation, before you write the card:
+
+- Set a hostname, a user, and a password.
+- Enable SSH.
+- Set the Wi-Fi country. This is also the regulatory domain. If you skip it, 5 GHz channels are marked disabled and the sweep drops them.
+- If the Pi will join the LAN on its built-in Wi-Fi, enter that network here. Ethernet needs nothing extra.
+
+Do not configure a USB adapter as the management network. dump3411 will refuse to put the interface that carries the default route into monitor mode, and it will refuse the Pi's onboard radio (`brcmfmac`). One of those two has to stay up for SSH.
+
+### 2. Plug in hardware, then boot
+
+- Power, and either Ethernet or the onboard Wi-Fi from the step above.
+- The USB monitor adapters. Two Alfa AWUS036ACS is the setup this sweep is written for: one covers 2.4 GHz, the other walks 5 GHz.
+- A powered USB hub if you are adding a third adapter, or if an adapter enumerates and then disappears. A Pi 4's ports share a 1.2 A budget. Two ACS adapters have run on the onboard ports; three or four should not.
+
+Boot and SSH in as the user you set in Imager.
+
+### 3. Confirm the radios before installing
 
 ```bash
-git clone https://github.com/ifnull/dump3411.git
+cat /etc/os-release          # VERSION_CODENAME=trixie
+lsusb                        # Realtek 8812AU/8821AU, one line per ACS
+ip -br link                  # wlan0 onboard; wlan1/wlan2 (or wlx*) for the USB radios
+sudo iw reg get              # country US (or yours), not 00
+```
+
+`iw` is not on the Lite image until step 4. If you need the country check first:
+
+```bash
+sudo apt update
+sudo apt install -y iw
+sudo iw reg get
+```
+
+If the country is unset, set it so it survives reboot, then reboot before scanning:
+
+```bash
+sudo raspi-config            # Localisation Options → WLAN Country
+```
+
+`sudo iw reg set US` works until the next reboot. It is not a substitute for raspi-config.
+
+Each ACS should have a `wlan` or `wlx` interface. The driver is `rtw88_8821au`:
+
+```bash
+basename $(readlink /sys/class/net/wlan1/device/driver)
+```
+
+An adapter in `lsusb` with no interface is power, cable, or the wrong OS — not a dump3411 setting.
+
+### 4. Install
+
+Lite does not always include `git`.
+
+```bash
+sudo apt install -y git
+git clone -b feat/dual-adapter-scan https://github.com/andematt/dump3411.git
 cd dump3411
 sudo ./install.sh
 ```
 
-`install.sh` installs apt dependencies, checks that a USB Wi-Fi adapter is plugged in, rewrites the systemd unit's `ExecStart` path to match this checkout, then enables + starts the service. The unit uses `--wifi-iface auto`, so plugging in a second adapter and restarting is enough — no unit edit. It's idempotent; re-run after a `git pull` to roll out config changes.
+`install.sh` is idempotent. It:
 
-Open the dashboard from any LAN host:
+1. Installs `python3-bleak`, `iw`, `rfkill`, and `bluez`.
+2. Asks whether to install `python3-paho-mqtt`. Answer `y` if you will connect Home Assistant. Answer `n` and the detector still runs; MQTT stays off.
+3. Checks that a USB Wi-Fi interface exists (anything `wlan*` / `wlx*` except `wlan0`).
+4. Rewrites the systemd unit's path to this checkout and installs it.
+5. Enables and starts `dump3411`.
+
+The unit runs `--wifi-iface auto`. A second adapter plugged in later is picked up on restart. No unit edit.
+
+The service is enabled, so it starts again after a reboot. Adapter names can swap; roles are assigned by MAC, so the same radio keeps 5 GHz.
+
+### 5. Check that it is scanning
+
+```bash
+systemctl is-enabled dump3411          # enabled
+systemctl is-active dump3411           # active
+journalctl -u dump3411 -n 80 --no-pager
+```
+
+You want a plan line, then a measured sweep. On two ACS adapters that looks like:
+
+```
+Not using wlan0: it is the Pi onboard radio
+Wi-Fi plan: wlan2 plan C role=2.4 ... ; wlan1 plan B role=5 21 ch ~21s
+wlan2 plan C: 9s ch6 + 1 of 4 explore @ 1s — full sweep 40.1s including 14ms retune
+wlan1 plan B: 1s ch149 + all 20 explore @ 1s — full sweep 21.5s including 22ms retune
+```
+
+The retune times are measured on that boot. A line that says `Not using wlanX: it is carrying the network connection` means that adapter is your SSH link and will not scan.
+
+A `[org.bluez.Error.NotReady]` line in the first second is normal. `set_monitor_mode` runs `rfkill unblock all`, which also kicks Bluetooth, and the BLE scanner retries until the controller is back.
+
+Dashboard, from any LAN host:
 
 ```bash
 echo "http://$(hostname -I | awk '{print $1}'):8754/"
 ```
 
-If you'd rather do it by hand, the manual install is:
+The radios table on that page is the same assignment the journal printed. No drones and an IDLE pill means the radios are up and the air is empty.
 
-```bash
-sudo apt install -y python3-bleak iw rfkill bluez
-# edit ExecStart in dump3411.service for your interface and repo path
-sudo cp dump3411.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now dump3411
-```
+### 6. Optional: keep the journal across reboots
 
-Service status / live tail:
-
-```bash
-sudo systemctl status dump3411
-journalctl -u dump3411 -f
-```
-
-By default the journal is volatile — wiped on reboot. To make detection history persist (capped at 50 MB so it can never fill the disk):
+The journal is volatile by default. This drop-in caps it at 50 MB:
 
 ```bash
 sudo mkdir -p /etc/systemd/journald.conf.d
 sudo cp journald-dump3411.conf /etc/systemd/journald.conf.d/
 sudo systemctl restart systemd-journald
 ```
+
+Detection history in SQLite is a separate option. See **Persistent detection history** below. It is off until you set `HISTORY_DB`.
+
+### Manual install
+
+`install.sh` is the path above. The equivalent by hand, from a checkout of this branch:
+
+```bash
+sudo apt install -y python3-bleak iw rfkill bluez
+# edit the ExecStart path in dump3411.service if the checkout is not /home/pi/dump3411
+# leave --wifi-iface auto
+sudo cp dump3411.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now dump3411
+```
+
+## Home Assistant connection
+
+Optional. The detector does not need a broker. This is how the Pi that is already scanning publishes into an existing Home Assistant Mosquitto broker and shows up as entities.
+
+Home Assistant must already be on the LAN, with:
+
+- The **Mosquitto broker** app installed, started, and set to start on boot. Port **1883** is the plaintext listener.
+- The **MQTT** integration loaded. Discovery is on by default (`discovery_prefix: homeassistant`). Leave it on. dump3411 does not create entities any other way.
+
+### 1. Add a broker login
+
+In the Mosquitto app configuration, add a local login used only by this Pi. A separate user is better than reusing one that belongs to another device.
+
+- Username: `dump3411`
+- Password: one you generate. Do not commit it, and do not reuse another add-on's password.
+
+Save, then restart the Mosquitto app. A login change does not apply until that restart. Other MQTT clients drop for a few seconds while it restarts.
+
+Find the broker address from the Pi:
+
+```bash
+getent hosts homeassistant.local
+```
+
+Use that IP if mDNS is flaky. The port is 1883.
+
+### 2. Point dump3411 at the broker
+
+If you answered `n` to paho-mqtt during install:
+
+```bash
+sudo apt install -y python3-paho-mqtt
+```
+
+Write the env file the unit already loads (`EnvironmentFile=-/etc/dump3411.env`). Replace the broker address and the password:
+
+```bash
+sudo tee /etc/dump3411.env >/dev/null <<'EOF'
+MQTT_BROKER=192.168.1.9:1883
+MQTT_TOPIC_PREFIX=dump3411
+MQTT_USER=dump3411
+MQTT_PASSWORD=choose-a-password
+EOF
+sudo chmod 600 /etc/dump3411.env
+sudo systemctl restart dump3411
+```
+
+`chmod 600` matters. The unit runs as root and is the only thing that should read the password.
+
+The same values work as flags if you are not using the unit: `--mqtt-broker`, `--mqtt-topic-prefix`, `--mqtt-user`, `--mqtt-password`.
+
+### 3. Confirm the publish
+
+```bash
+journalctl -u dump3411 -n 40 --no-pager | grep -E 'MQTT|discovery'
+```
+
+A good connect looks like:
+
+```
+connecting to MQTT broker 192.168.1.9:1883
+MQTT connected to 192.168.1.9:1883
+published 4 Home Assistant discovery configs under homeassistant/
+```
+
+The service writes those four retained discovery configs on every connect. After a broker restart that kept its data directory, they are still there. After a wipe of that directory, the next time dump3411 connects it writes them again.
+
+`sudo python3 ha_setup.py` publishes the same configs without restarting the detector, and it does not touch `dump3411/online`. It reads `/etc/dump3411.env`. It does not create the broker user. `python3 ha_setup.py --dry-run` prints the topics and does not connect. `MQTT_DISCOVERY=false` in the env file turns discovery off.
+
+### 4. What shows up in Home Assistant
+
+Discovery creates one device and four entities. The state is a slice of a larger payload. The full drone row is on the broker, not in these four states.
+
+| Entity | Topic | State |
+|---|---|---|
+| `binary_sensor.dump3411_online` | `dump3411/online` | `online` or `offline` |
+| `sensor.dump3411_drones_active` | `dump3411/status` | drones in memory |
+| `sensor.dump3411_messages` | `dump3411/status` | decoded messages since process start |
+| `sensor.dump3411_last_detection` | `dump3411/events/detection` | latest UAS ID. Attributes are `rid_source`, `rssi`, `t`. `unknown` until a drone is heard |
+
+`dump3411/status` (retained, every 5 s) also carries uptime, last-seen age, per-source counts, and CPU temp. `dump3411/drones/<id>` (retained) is one drone row in the same shape as `/data/remoteid.json`: identity, lat/lon, altitude, AGL, speed, track, climb rate, RSSI, transports, self-ID, operator block. An empty retained payload is published when that drone expires. `dump3411/events/detection` is one small event per decode and is not retained.
+
+Units in those payloads are imperial, matching FEED.md.
+
+### 5. What survives a reboot
+
+| | Pi reboot | Home Assistant or Mosquitto reboot |
+|---|---|---|
+| The service | starts. The unit is enabled. | unrelated |
+| Entity registrations | stay | stay, if the retained discovery configs are still on the broker |
+| Online | `offline` on a clean stop, then `online` when it connects | restored from the broker, then refreshed when the Pi reconnects |
+| Drones active, message count | reset to 0. The tracker is memory only unless `HISTORY_DB` is set | restored from the retained status message, then overwritten by the live Pi within 5 s |
+| Last detection entity | keeps the last value Home Assistant already has. The event topic is not retained | not restored from the broker. Unknown until the next beacon |
+| Full drone rows on `dump3411/drones/<id>` | old retained rows stay on the broker. A rebooted Pi does not clear ids it no longer has in memory | kept across a normal Mosquitto restart. The add-on persists retained messages on its data directory. Gone if that directory is wiped |
+| Discovery configs | stay on the broker | same as the drone rows. dump3411 publishes them again on the next connect |
+| Individual detection events | gone | gone |
+
+A power cut does not run the clean stop. The broker's last-will sets `dump3411/online` to `offline`. It does not clear drone topics.
+
 
 ## What you'll see
 
@@ -117,13 +311,7 @@ Hearing a drone holds the radio on that channel until it goes quiet (about six s
 
 ## Configuration
 
-The default `dump3411.service` assumes:
-
-- Repository at `/home/pi/dump3411`
-- Wi-Fi capture is `--wifi-iface auto` (every USB monitor adapter except the backhaul)
-- Feed listens on `0.0.0.0:8754`
-
-Edit any of those in the service file before installing.
+`install.sh` rewrites the unit's `ExecStart` path to the checkout you ran it from. The checked-in template still says `/home/pi/dump3411` and `--wifi-iface auto`, and the feed listens on `0.0.0.0:8754`. Re-run `sudo ./install.sh` after moving the checkout. Do not hand-edit the installed unit to pin `wlan1` — `auto` is what assigns the radios.
 
 `dump3411.py --help` shows the full CLI:
 
@@ -168,27 +356,7 @@ curl -s http://<host>:8754/data/remoteid.json | python3 -m json.tool
 
 ## MQTT publisher
 
-dump3411 can publish detections to an MQTT broker so consumers (Home Assistant automations, Node-RED, custom scripts) react without polling the JSON feed. Optional — only active when `--mqtt-broker` is configured.
-
-Install the client lib:
-
-```bash
-sudo apt install -y python3-paho-mqtt
-```
-
-Configure via env vars (the service unit reads `/etc/dump3411.env` if it exists):
-
-```bash
-# /etc/dump3411.env
-MQTT_BROKER=mqtt.lan:1883
-MQTT_TOPIC_PREFIX=dump3411
-MQTT_USER=dump3411
-MQTT_PASSWORD=<your-password>
-```
-
-Then `sudo systemctl restart dump3411`. The same flags work on the CLI for manual runs: `--mqtt-broker`, `--mqtt-topic-prefix`, `--mqtt-user`, `--mqtt-password`.
-
-On every connect the publisher also writes retained Home Assistant MQTT discovery configs (`homeassistant/sensor/dump3411/.../config` and the online binary sensor). That is what creates the entities. Set `MQTT_DISCOVERY=false` to skip it. `sudo python3 ha_setup.py` publishes the same configs without restarting the detector, and without touching `dump3411/online`. It reads `/etc/dump3411.env`. It does not create the broker user.
+dump3411 can publish detections to an MQTT broker so consumers react without polling the JSON feed. Optional — only active when `MQTT_BROKER` is set. The Home Assistant steps, including the env file and the entities that appear, are in **Home Assistant connection** above.
 
 Topic layout (under the configured prefix, default `dump3411`):
 
