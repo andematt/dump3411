@@ -6,7 +6,7 @@ Spiritual sibling of [dump1090](https://github.com/flightaware/dump1090) (ADS-B 
 
 ## Set up a fresh Pi
 
-This is the path that reproduces the running node: a newly flashed Raspberry Pi, USB monitor-mode adapters, the service starting on boot, and — if you want it — Home Assistant. Upstream `ifnull/dump3411` `main` does not have the dual-adapter sweep. Clone this fork's `feat/dual-adapter-scan` branch.
+This is the path that reproduces the running node: a newly flashed Raspberry Pi, USB monitor-mode adapters, the service starting on boot, and — if you want it — Home Assistant. Clone `main` of this fork.
 
 Confirmed on a Raspberry Pi 4 (3 GB) running Raspberry Pi OS Trixie, with two Alfa AWUS036ACS adapters and the Pi's built-in Wi-Fi used only for SSH.
 
@@ -70,7 +70,7 @@ Lite does not always include `git`.
 
 ```bash
 sudo apt install -y git
-git clone -b feat/dual-adapter-scan https://github.com/andematt/dump3411.git
+git clone https://github.com/andematt/dump3411.git
 cd dump3411
 sudo ./install.sh
 ```
@@ -130,7 +130,7 @@ Detection history in SQLite is a separate option. See **Persistent detection his
 
 ### Manual install
 
-`install.sh` is the path above. The equivalent by hand, from a checkout of this branch:
+`install.sh` is the path above. The equivalent by hand, from a checkout of `main`:
 
 ```bash
 sudo apt install -y python3-bleak iw rfkill bluez
