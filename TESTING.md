@@ -71,3 +71,5 @@ Pre-built firmware for the ESP32-S3. Flash with the Espressif flash tool, plug i
 ## 4. Decoder tests from reference-encoder frames
 
 `python3 tests/test_frdid.py` (or `pytest tests/`) checks French Direct Remote ID beacon decoding, end to end through the Wi-Fi packet handler and the tracker, against frames built by opendroneid-core-c's own French encoder. None of the three tools above transmit that format. `tests/gen_frdid.c` regenerates the frames; build instructions are at the top of the file.
+
+`python3 tests/test_scan_plan.py` checks the dual-adapter channel plan: which radio gets 2.4, how 5 GHz is split, and the sweep times. It does not need a radio.

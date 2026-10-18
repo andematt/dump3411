@@ -121,4 +121,5 @@ Additive fields do **not** bump `schema_version`.
 | `cpu_temp_c` | number \| null | ✓ | Host CPU temperature (°C), `null` when unreadable |
 | `history_enabled` | boolean | ✓ | `true` when `--history-db` is configured |
 | `history` | object |  | `{rows, drones, size_bytes, earliest_ts, latest_ts}`; present only when history is enabled |
+| `radios` | array |  | One object per Wi-Fi feeder: `iface`, `role` (`2.4` \| `5` \| `both` \| `2.4-explore` \| `legacy` \| `fixed`), `plan` (`A` \| `B` \| `C` \| `E` \| `legacy` \| `fixed`), `channel` (tuned now, or null), `camping` (channel being held, or null), `channels` (how many the plan covers), `sweep_s` (estimated seconds for a full pass of this radio, null until measured / on a flat hop). Empty when no feeder was handed to the server. |
 

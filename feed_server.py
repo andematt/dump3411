@@ -7,7 +7,7 @@ Tiny stdlib HTTP server. Endpoints:
   GET /                       — single-page status dashboard (HTML)
   GET /data/remoteid.json     — current tracker snapshot per FEED.md
   GET /status                 — operational health: uptime, per-source
-                                counters, CPU temp, drones_active
+                                counters, CPU temp, drones_active, Wi-Fi radios
 
 Constraints from FEED.md "Producer obligations":
   * **Snapshot-only handlers.** No decoding, conversion, or computation under
@@ -124,6 +124,12 @@ _DASHBOARD_HTML = """<!doctype html>
 <table>
   <thead><tr><th>Source</th><th>Messages</th><th>Last seen</th></tr></thead>
   <tbody id="by_source"></tbody>
+</table>
+
+<h2>Wi-Fi radios</h2>
+<table>
+  <thead><tr><th>Iface</th><th>Role</th><th>Plan</th><th>Now</th><th>Full sweep</th></tr></thead>
+  <tbody id="radios"><tr><td class="empty" colspan="5">–</td></tr></tbody>
 </table>
 
 <h2>Drones</h2>
@@ -330,6 +336,26 @@ async function tick() {
            + '<td class="num">' + x.messages.toLocaleString() + '</td>'
            + '<td class="num">' + (x.last_seen_s == null ? 'never' : fmt.age(x.last_seen_s)) + '</td></tr>';
     }).join('');
+
+    const radios = s.radios || [];
+    const radioBody = document.getElementById('radios');
+    if (radioBody) {
+      if (!radios.length) {
+        radioBody.innerHTML = '<tr><td class="empty" colspan="5">no Wi-Fi radio</td></tr>';
+      } else {
+        radioBody.innerHTML = radios.map(function (r) {
+          var now = r.channel == null ? '–' : String(r.channel);
+          if (r.camping) now += ' camp';
+          var sweep = '–';
+          if (r.sweep_s != null) {
+            sweep = r.sweep_s >= 90 ? (r.sweep_s / 60).toFixed(1) + ' min' : Math.round(r.sweep_s) + 's';
+          }
+          var n = r.channels == null ? '' : ' · ' + r.channels + ' ch';
+          return '<tr><td>' + r.iface + '</td><td>' + r.role + n + '</td><td>' + r.plan
+            + '</td><td class="num">' + now + '</td><td class="num">' + sweep + '</td></tr>';
+        }).join('');
+      }
+    }
 
     const historyEnabled = !!s.history_enabled;
     document.getElementById('recent-heading').style.display = historyEnabled ? '' : 'none';
@@ -559,6 +585,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     tracker: Tracker        # filled in by make_server()
     history  = None         # HistoryWriter | None; None disables /history and /map
+    radios   = None         # WiFiFeeder list; None omits live radio rows
     server_version = f"dump3411/{get_version()}"
     sys_version    = ""     # suppress the default "Python/3.x" Server suffix
 
@@ -606,6 +633,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     doc["history"] = self.history.stats()
                 except Exception:
                     log.exception("history stats failed")
+            # A handful of integer reads off the hopper threads. Not a scan.
+            feeders = self.radios or []
+            doc["radios"] = [radio.status() for radio in feeders]
             body = json.dumps(doc, separators=(",", ":")).encode("utf-8")
             return body, "application/json"
         if bare in ("/", "/index.html"):
@@ -696,19 +726,23 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 # -- Server constructors -------------------------------------------------------
 
 def make_server(addr: Tuple[str, int], tracker: Tracker,
-                history=None) -> http.server.ThreadingHTTPServer:
+                history=None, radios=None) -> http.server.ThreadingHTTPServer:
     """Build a ThreadingHTTPServer bound to ``addr`` serving ``tracker``.
 
     When ``history`` is provided, ``/history.json`` and ``/map`` light up
     and ``/status`` exposes ``history_enabled: true`` (used by the
     dashboard to decide whether to render UAS-IDs as clickable map links).
 
+    ``radios`` is the live Wi-Fi feeder list. ``/status`` then includes a
+    ``radios`` array (iface, role, plan, current channel). Absent feeders
+    produce an empty list, which does not bump ``schema_version``.
+
     Returns the server instance so the caller can ``serve_forever()`` it on
     any thread and ``shutdown()`` it cleanly (used by the standalone test
     below).
     """
     handler_cls = type("Handler", (_Handler,),
-                       {"tracker": tracker, "history": history})
+                       {"tracker": tracker, "history": history, "radios": radios})
     return http.server.ThreadingHTTPServer(addr, handler_cls)
 
 

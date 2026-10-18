@@ -6,7 +6,7 @@ Spiritual sibling of [dump1090](https://github.com/flightaware/dump1090) (ADS-B 
 
 ## Quickstart
 
-You'll need a Linux host with Python 3.10+, a Bluetooth adapter (built-in or USB), and a USB Wi-Fi adapter that supports monitor mode (Alfa AWUS036NEH or any Ralink RT3070-based adapter).
+You'll need a Linux host with Python 3.10+, a Bluetooth adapter (built-in or USB), and a USB Wi-Fi adapter that supports monitor mode. A 2.4 GHz card (Alfa AWUS036NEH, RT3070) sees the 2.4 GHz beacons. A dual-band card — Alfa AWUS036ACS (RTL8811AU) is the fast one — also sees 5 GHz. Two of those, one on each band, is the setup this sweep is built for.
 
 ```bash
 git clone https://github.com/ifnull/dump3411.git
@@ -14,7 +14,7 @@ cd dump3411
 sudo ./install.sh
 ```
 
-`install.sh` installs apt dependencies, auto-detects your USB Wi-Fi adapter (prompts if multiple are present), rewrites the systemd unit's `ExecStart` paths to match this checkout, then enables + starts the service. It's idempotent — re-run after a `git pull` to roll out config changes.
+`install.sh` installs apt dependencies, checks that a USB Wi-Fi adapter is plugged in, rewrites the systemd unit's `ExecStart` path to match this checkout, then enables + starts the service. The unit uses `--wifi-iface auto`, so plugging in a second adapter and restarting is enough — no unit edit. It's idempotent; re-run after a `git pull` to roll out config changes.
 
 Open the dashboard from any LAN host:
 
@@ -83,15 +83,36 @@ Map view at `/map?uas_id=…` — operator location pinned, drone polyline trace
 Confirmed on a Raspberry Pi Zero W with an Alfa AWUS036NEH adapter. Should work on **any Linux host** that has:
 
 - **A Bluetooth adapter** for BLE Remote ID. Built-in is fine.
-- **A USB Wi-Fi adapter that supports monitor mode** for Wi-Fi Beacon Remote ID. The Alfa AWUS036NEH (RT3070) is what we tested. Most built-in Wi-Fi cards can't reliably enter monitor mode, so a dedicated USB adapter is the easy path.
+- **A USB Wi-Fi adapter that supports monitor mode** for Wi-Fi Beacon Remote ID. The Alfa AWUS036NEH (RT3070) is 2.4 GHz only, which is what the original flat hop was written for. Most built-in Wi-Fi cards can't reliably enter monitor mode, so a dedicated USB adapter is the easy path.
+- **A dual-band adapter** if you want 5 GHz. The Alfa AWUS036ACS (RTL8811AU) changes channel in about 20 ms, which is what makes a 21-channel 5 GHz sweep take about 21 seconds instead of a minute of deaf retunes. Its driver (`rtw88_8821au`) is in newer kernels — Raspberry Pi OS Trixie has it; Bookworm often does not, in which case the adapter shows up in `lsusb` and never gets an interface. A Panda AC600-class MT7610U card is the fallback on those kernels. It works; it retunes slower, and the startup log says by how much.
 
-On low-powered single-board hosts a powered USB hub is strongly recommended — the Wi-Fi adapter's current draw can brown out the SBC otherwise.
+On low-powered single-board hosts a powered USB hub is strongly recommended — one adapter can brown out a Pi Zero, and two or three will. A Pi 4's USB ports share one 1.2 A budget and one bus.
+
+### Two adapters, and more than two
+
+A monitor radio hears one channel at a time. Compliant aircraft beacon on channel 6 or 149 about once a second, and may transmit anywhere else only by going to at least 5 Hz, so the sweep sits on 6 and 149 and spends one second on each other channel. The 5 GHz list is 21 channels (149, 153–165, and the DFS channels 52–144). U-NII-1 is left out: it is indoor and low power, and a compliant beacon stays on 149 no matter where the video link is.
+
+| Radios | What they do | Time to cover every 5 GHz channel |
+|---|---|---|
+| 1 dual-band | Channel 6 most of the time, channel 149 every cycle, one other channel per cycle | ~2.5 min |
+| 2 (one on 2.4, one sweeping 5) | The 2.4 radio owns channel 6; the other walks all 21 | **~21 s** |
+| 3 | The extra radio takes half of the 5 GHz list | ~11 s |
+| 4 | Three-way split of 5 GHz | ~7 s |
+| 5 | Four-way split | ~6 s |
+
+Those times assume a fast retune, about 20 ms, and the 1 second dwell. They are estimates; the process measures the retune at startup and logs the cycle that radio will actually run. A slow adapter (a second per channel change) spends most of the sweep deaf, and no amount of planning fixes that.
+
+A third adapter does help. It is the difference between a 21-second hole and an 11-second one, and it keeps scanning its half of 5 GHz while the other radio is holding a detection. A fourth still helps. A fifth barely does: the dwell itself is a second, and you cannot visit a channel in less time than you are willing to listen. Past two or three ACS adapters the limit is usually the host, not the plan — USB current, one shared USB bus, and Python reading every management frame. A Pi Zero is already busy with one adapter. A Pi 4 or 5 with a powered hub is the machine for three or four.
+
+A 2.4-only spare is not given 5 GHz work it cannot do. It sweeps the other 2.4 channels while its partner sits on channel 6. Further 2.4-only cards are left idle; that band is already small.
+
+Hearing a drone holds the radio on that channel until it goes quiet (about six seconds of silence on 6 or 149, about three anywhere else). The 5 GHz radio in a pair may hold indefinitely, because its partner never leaves 2.4 uncovered for more than one explore visit. A single radio breaks the hold about every 10 seconds to look at the other social channel and the next explore channel, then goes back.
 
 ## Software
 
 - Linux with **systemd** (the included `dump3411.service` requires it; `run-offline.sh` works without).
 - **Python 3.10+** (uses PEP 604 `int | None` syntax).
-- Tested on Raspberry Pi OS Bookworm; any modern systemd distro with Python 3.10+ should work too (Debian 12, Ubuntu 22.04+, Fedora, …).
+- Tested on Raspberry Pi OS Bookworm with a 2.4 GHz adapter. The AWUS036ACS needs a newer kernel (Raspberry Pi OS Trixie ships its driver; Bookworm usually does not). Any modern systemd distro with Python 3.10+ should work too (Debian 12, Ubuntu 22.04+, Fedora, …).
 - Architecture-agnostic — runs on ARMv6, ARMv7, AArch64, and x86_64.
 
 ## Configuration
@@ -99,7 +120,7 @@ On low-powered single-board hosts a powered USB hub is strongly recommended — 
 The default `dump3411.service` assumes:
 
 - Repository at `/home/pi/dump3411`
-- USB Wi-Fi adapter is `wlan1`
+- Wi-Fi capture is `--wifi-iface auto` (every USB monitor adapter except the backhaul)
 - Feed listens on `0.0.0.0:8754`
 
 Edit any of those in the service file before installing.
@@ -108,16 +129,19 @@ Edit any of those in the service file before installing.
 
 ```
 --ble-adapter HCI    HCI adapter for BLE scan          (default: hci0)
---wifi-iface IFACE   monitor-mode interface             (default: wlan1)
---channel-dwell SEC  seconds per channel before hop     (default: 0.2)
---channel CH         stay on one WiFi channel           (default: hop 1-11)
---max-channel N      highest WiFi channel, 11-13        (default: 11)
+--wifi-iface IFACE   monitor interface; repeatable, or 'auto' (default: $WIFI_IFACES or wlan1)
+--scan-plan PLAN     auto | legacy                     (default: auto)
+--channel-dwell SEC  seconds per channel, legacy hop    (default: 0.2)
+--channel CH         stay on one WiFi channel           (default: scan plan)
+--max-channel N      highest 2.4 GHz channel, 11-13     (default: 11)
 --serve HOST:PORT    serve /data/remoteid.json + /      (omit for journal-only)
 --ttl SECS           drop drones after N s of silence   (default: 60)
 --verbose            log every decoded message type
 ```
 
-Outside North America, Wi-Fi channels 12 and 13 are legal and a drone's own Wi-Fi (and its beacon Remote ID) can use them. `--max-channel 13` adds them to the hop. The adapter can only tune them when the kernel's regulatory domain allows, so set the Wi-Fi country first (`sudo iw reg set FR`, or the WLAN country in `raspi-config`; `iw reg get` shows the current one). If a channel is refused, dump3411 logs a warning and drops it from the hop rather than silently staying on 11.
+Outside North America, Wi-Fi channels 12 and 13 are legal and a drone's own Wi-Fi (and its beacon Remote ID) can use them. `--max-channel 13` adds them to the 2.4 plan. The adapter can only tune them when the kernel's regulatory domain allows, so set the Wi-Fi country first (`sudo iw reg set FR`, or the WLAN country in `raspi-config`; `iw reg get` shows the current one). If a channel is refused, dump3411 logs a warning and drops it rather than silently staying on 11. 5 GHz channels are gated the same way: whatever `iw` does not advertise is not visited.
+
+`--scan-plan legacy` is the old flat hop of channels 1 to `--max-channel` at `--channel-dwell` seconds, on one radio. A single 2.4-only adapter still does that by default, because it cannot see 5 GHz and the flat hop is what that hardware was tested with. `--channel` pins one named interface and does not combine with `auto`.
 
 ## Status dashboard
 
@@ -126,6 +150,7 @@ Outside North America, Wi-Fi channels 12 and 13 are legal and a drone's own Wi-F
 - Service health pill (ACTIVE / IDLE / OFFLINE)
 - Top tiles: uptime, last-beacon age, drones active, total messages, CPU temp
 - Per-transport message counters with last-seen timestamps (BLE split into Bluetooth 4 legacy and Bluetooth 5 long-range/extended, so a radio stack that can't receive BT5 is visible at a glance)
+- Wi-Fi radios: which adapter is on which plan, the channel it is on now, and how long a full sweep of its list takes
 - Table of currently tracked drones — UAS-ID, type, **drone + operator coordinates as Google Maps links**, altitude, AGL, ground speed, track, RSSI, transport (every transport the drone was heard on, most recent first — previously-heard transports dimmed), age
 - Unit toggle (per-browser, persists in `localStorage`)
 

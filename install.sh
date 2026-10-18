@@ -2,9 +2,11 @@
 #
 # dump3411 install helper.
 #
-# Detects your monitor-mode Wi-Fi interface, rewrites the systemd unit's
-# ExecStart paths to point at this checkout, installs the apt dependencies,
+# Checks that a USB Wi-Fi adapter is present, rewrites the systemd unit's
+# ExecStart path to point at this checkout, installs the apt dependencies,
 # copies the unit into /etc/systemd/system, and enables + starts the service.
+# The unit uses --wifi-iface auto, so a second adapter is picked up on restart
+# without editing the unit.
 #
 # Idempotent — re-run safely after a `git pull` to roll out config changes.
 #
@@ -62,11 +64,13 @@ fi
 echo
 
 
-# --- 2) detect monitor-mode Wi-Fi interface ----------------------------------
+# --- 2) confirm a USB Wi-Fi adapter is present --------------------------------
 
-echo "[2/5] Detecting USB monitor-mode Wi-Fi interface..."
-# Prefer wlan*/wlx* interfaces other than wlan0 (which is usually the
-# built-in adapter providing the management network).
+echo "[2/5] Checking for a USB Wi-Fi adapter..."
+# wlan0 is usually the Pi's built-in radio, which cannot do monitor mode and
+# is the management link. Runtime discovery (--wifi-iface auto) makes the
+# same call from the driver and the default route, so this is only a
+# presence check.
 mapfile -t IFACES < <(
     ip -o link show 2>/dev/null \
         | awk -F': ' '{print $2}' \
@@ -77,45 +81,34 @@ mapfile -t IFACES < <(
 )
 
 if [[ ${#IFACES[@]} -eq 0 ]]; then
-    echo "      No candidate USB Wi-Fi interface found (looked for wlan*/wlx* except wlan0)."
-    echo "      Make sure your monitor-mode adapter is plugged in and listed by 'ip link'."
-    read -rp "      Specify interface manually (e.g. wlan1): " WIFI_IFACE
-elif [[ ${#IFACES[@]} -eq 1 ]]; then
-    WIFI_IFACE="${IFACES[0]}"
-    echo "      Auto-detected: $WIFI_IFACE"
-else
-    echo "      Multiple candidates:"
-    for i in "${!IFACES[@]}"; do
-        echo "        $((i+1))) ${IFACES[i]}"
-    done
-    read -rp "      Pick one [1-${#IFACES[@]}]: " choice
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#IFACES[@]} )); then
-        echo "      Invalid choice — abort." >&2
-        exit 1
-    fi
-    WIFI_IFACE="${IFACES[$((choice - 1))]}"
-fi
-
-if [[ -z "$WIFI_IFACE" ]]; then
-    echo "No Wi-Fi interface chosen — abort." >&2
+    echo "      No USB Wi-Fi interface found (looked for wlan*/wlx* except wlan0)." >&2
+    echo "      Plug in a monitor-mode adapter and re-run." >&2
     exit 1
 fi
-echo "      Using: $WIFI_IFACE"
+
+echo "      Found: ${IFACES[*]}"
+echo "      The service uses --wifi-iface auto: every USB monitor adapter"
+echo "      except the one carrying your network connection."
+if [[ ${#IFACES[@]} -ge 2 ]]; then
+    echo "      ${#IFACES[@]} adapters: one covers 2.4 GHz, the rest split 5 GHz."
+else
+    echo "      One adapter. A second dual-band adapter cuts the 5 GHz sweep"
+    echo "      from about 2.5 minutes to about 21 seconds. Plug it in and restart."
+fi
 echo
 
 
 # --- 3) rewrite the unit -----------------------------------------------------
 
 echo "[3/5] Generating systemd unit..."
-# Substitute the ExecStart path and the --wifi-iface argument from the
-# checked-in template. The pristine template lives in $SERVICE_SRC, so this is
-# safe to re-run without ever modifying the repo copy.
+# Substitute the ExecStart path from the checked-in template. The pristine
+# template lives in $SERVICE_SRC, so this is safe to re-run without ever
+# modifying the repo copy. --wifi-iface auto stays as written.
 sed \
     -e "s|/home/pi/dump3411/dump3411.py|$SCRIPT_DIR/dump3411.py|g" \
-    -e "s| --wifi-iface wlan1 | --wifi-iface $WIFI_IFACE |g" \
     "$SERVICE_SRC" > "$SERVICE_TMP"
 echo "      ExecStart -> $SCRIPT_DIR/dump3411.py"
-echo "      Interface -> $WIFI_IFACE"
+echo "      Interface -> auto"
 echo
 
 

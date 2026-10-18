@@ -2,10 +2,12 @@
 """
 dump3411 WiFi detector — offline Remote ID capture.
 
-Puts a USB monitor-mode adapter (e.g. Alfa AWUS036NEH, RT3070) into monitor
-mode, hops 2.4 GHz channels 1-11 (or pins one channel with --channel),
-decodes Remote ID from 802.11 beacon frames (ASTM F3411), and prints
-detections to the terminal / systemd journal.
+Puts one or more USB monitor-mode adapters into monitor mode and listens
+for Remote ID. A 2.4-only card (Alfa AWUS036NEH, RT3070) still hops
+channels 1-11. A dual-band card sweeps 2.4 and 5 GHz, spending most of
+its time on the social channels (6 and 149). Two or more cards split the
+work: one covers 2.4 GHz, the rest divide 5 GHz. ``--channel`` still pins
+a single radio.
 No network connection, no token, no data sharing.
 
 Supports:
@@ -17,6 +19,7 @@ Uses raw AF_PACKET sockets (stdlib only — no scapy dependency).
 
 Usage:
     sudo python3 wifi_feeder.py --iface wlan1 [--channel CH] [--verbose]
+    sudo python3 wifi_feeder.py --iface auto          # every USB adapter
 
 Requirements:
     sudo apt install iw rfkill
@@ -26,6 +29,7 @@ import argparse
 import hashlib
 import logging
 import os
+import re
 import signal
 import socket
 import struct
@@ -320,23 +324,37 @@ def decode_rid_message(raw_bytes: bytes) -> dict | None:
 # -- Raw 802.11 Frame Parsers --------------------------------------------------
 # Replaces scapy — uses stdlib socket + struct only.
 
-def _parse_radiotap(data: bytes) -> tuple[int, int | None]:
+def _freq_to_channel(freq_mhz: int) -> int | None:
+    """Wi-Fi center frequency (MHz) to channel number. None if unknown."""
+    if 2412 <= freq_mhz <= 2472:
+        return (freq_mhz - 2412) // 5 + 1
+    if freq_mhz == 2484:
+        return 14
+    if 5180 <= freq_mhz <= 5885:
+        return (freq_mhz - 5000) // 5
+    return None
+
+
+def _parse_radiotap(data: bytes) -> tuple[int, int | None, int | None]:
     """
     Parse RadioTap header (IEEE 802.11-2020 Annex I).
-    Returns (header_length, rssi_dbm_or_None).
+    Returns (header_length, rssi_dbm_or_None, channel_or_None).
 
     Fields are walked in present-bitmap order with natural alignment relative
     to the start of the header. Only fields needed to reach dBm Signal (bit 5)
-    are decoded; the rest are skipped by size.
+    are decoded; the rest are skipped by size. The channel comes from the
+    frequency the frame was actually received on, which is what a camp decision
+    has to trust — the hopper's idea of the current channel can be a retune behind.
     """
     if len(data) < 8:
-        return len(data), None
+        return len(data), None, None
 
     rt_len  = struct.unpack_from('<H', data, 2)[0]
     present = struct.unpack_from('<I', data, 4)[0]
 
-    rssi   = None
-    offset = 8  # first field starts after the fixed 8-byte header
+    rssi    = None
+    channel = None
+    offset  = 8  # first field starts after the fixed 8-byte header
 
     # Bit 31 (EXT): chipsets like Atheros AR9271 chain additional present words
     # before field data begins. Read each word and check its own bit 31 — do not
@@ -345,7 +363,7 @@ def _parse_radiotap(data: bytes) -> tuple[int, int | None]:
     ext_word = present
     while ext_word & (1 << 31):
         if offset + 4 > len(data):
-            return rt_len, None
+            return rt_len, None, None
         ext_word = struct.unpack_from('<I', data, offset)[0]
         offset += 4
 
@@ -362,6 +380,9 @@ def _parse_radiotap(data: bytes) -> tuple[int, int | None]:
     # Bit 3: Channel — uint16 freq + uint16 flags, align 2
     if present & (1 << 3):
         offset = (offset + 1) & ~1
+        if offset + 2 <= len(data):
+            freq_mhz = struct.unpack_from('<H', data, offset)[0]
+            channel = _freq_to_channel(freq_mhz)
         offset += 4
     # Bit 4: FHSS — uint8 hop_set + uint8 hop_pattern
     if present & (1 << 4):
@@ -372,7 +393,7 @@ def _parse_radiotap(data: bytes) -> tuple[int, int | None]:
             rssi = struct.unpack_from('b', data, offset)[0]
         offset += 1
 
-    return rt_len, rssi
+    return rt_len, rssi, channel
 
 
 def _mac_str(b: bytes) -> str:
@@ -646,6 +667,7 @@ def _parse_nan_sda(sda: bytes) -> bytes | None:
 # -- Monitor Mode --------------------------------------------------------------
 
 _NM_CONF = "/etc/NetworkManager/conf.d/dump3411.conf"
+_nm_lock = threading.Lock()
 
 
 def _get_backhaul_iface() -> str | None:
@@ -671,23 +693,40 @@ def _get_iface_mac(iface: str) -> str | None:
         return None
 
 
-def _set_nm_unmanaged(mac: str):
+def _nm_macs_in(text: str) -> set[str]:
+    return {match.group(1).lower() for match in re.finditer(r"mac:([0-9a-f:]{17})", text, re.I)}
+
+
+def _set_nm_unmanaged(mac: str | list[str]):
     """
-    Tell NetworkManager to leave the monitor-mode adapter alone. If NM manages
-    the interface it fights monitor mode, causing zero packet capture.
+    Tell NetworkManager to leave monitor-mode adapters alone. If NM manages
+    an interface it fights monitor mode, causing zero packet capture.
+
+    Merges with any MACs already in the file so a second radio does not
+    wipe the first. ``mac`` may be one address or a list.
     """
-    nm_body = (
-        "# dump3411 — keep NetworkManager off the monitor-mode adapter.\n"
-        "[keyfile]\n"
-        f"unmanaged-devices=mac:{mac}\n"
-    )
-    try:
-        os.makedirs(os.path.dirname(_NM_CONF), exist_ok=True)
-        with open(_NM_CONF, "w") as f:
-            f.write(nm_body)
-        log.info(f"[Monitor] NetworkManager set to ignore {mac}")
-    except Exception as e:
-        log.warning(f"[Monitor] Could not update NM config: {e}")
+    incoming = [mac] if isinstance(mac, str) else list(mac)
+    with _nm_lock:
+        try:
+            with open(_NM_CONF) as f:
+                existing = _nm_macs_in(f.read())
+        except OSError:
+            existing = set()
+        macs = existing | {item.lower() for item in incoming if item}
+        if not macs:
+            return
+        nm_body = (
+            "# dump3411 — keep NetworkManager off monitor-mode adapters.\n"
+            "[keyfile]\n"
+            "unmanaged-devices=" + ";".join(f"mac:{item}" for item in sorted(macs)) + "\n"
+        )
+        try:
+            os.makedirs(os.path.dirname(_NM_CONF), exist_ok=True)
+            with open(_NM_CONF, "w") as f:
+                f.write(nm_body)
+            log.info("[Monitor] NetworkManager set to ignore %s", ", ".join(sorted(macs)))
+        except Exception as e:
+            log.warning(f"[Monitor] Could not update NM config: {e}")
 
 
 def _ensure_monitor_safe(iface: str):
@@ -742,10 +781,11 @@ def restore_managed_mode(iface: str):
 
 
 def set_channel(iface: str, channel: int) -> bool:
-    """Set the monitor interface to a specific 2.4 GHz channel.
+    """Tune the monitor interface to ``channel`` (2.4 or 5 GHz).
 
     Returns False if iw refused, e.g. channel 12-13 under a regulatory domain
-    that doesn't allow them. The adapter then stays on its previous channel.
+    that doesn't allow them, or a 5 GHz channel on a 2.4-only card. The
+    adapter then stays on its previous channel.
     """
     r = subprocess.run(
         ["iw", "dev", iface, "set", "channel", str(channel)],
@@ -771,6 +811,8 @@ class ChannelHopper(threading.Thread):
         self.iface    = iface
         self.channels = channels
         self.dwell    = dwell
+        self.current_channel = channels[0] if channels else None
+        self.plan_name = "legacy"
         self._halt    = threading.Event()  # not _stop: that name shadows Thread._stop() and breaks join()
 
     def run(self):
@@ -786,7 +828,11 @@ class ChannelHopper(threading.Thread):
                                 f"from the hop list: {REGDOM_HINT}")
                     self.channels.remove(ch)
                     continue
+                self.current_channel = ch
                 time.sleep(self.dwell)
+
+    def notify_detection(self, channel: int | None) -> None:
+        """Flat hop ignores detection feedback. Present so capture can always call it."""
 
     def stop(self):
         self._halt.set()
@@ -794,25 +840,73 @@ class ChannelHopper(threading.Thread):
 
 # -- WiFi Detector -------------------------------------------------------------
 
+# Sentinel: None is a valid hopper (fixed channel), so the default has to be
+# something else or an explicit BandHopper could not be told apart from "build
+# the legacy hopper".
+_DEFAULT_HOPPER = object()
+
+
 class WiFiFeeder:
     def __init__(self, iface: str, verbose: bool = False, channel_dwell: float = 0.2,
                  channel: int | None = None, tracker: "Tracker | None" = None,
-                 max_channel: int = CHANNELS_24[-1]):
+                 max_channel: int = CHANNELS_24[-1], hopper=_DEFAULT_HOPPER,
+                 role: str | None = None):
         self.iface     = iface
         self.verbose   = verbose
         self.tracker   = tracker      # optional; when set, decoded messages also feed it
-        self.channel   = channel      # fixed channel; None = hop 1..max_channel
-        self.hopper    = None if channel is not None else \
-            ChannelHopper(iface, channels_up_to(max_channel), channel_dwell)
+        self.channel   = channel      # fixed channel; None = hop
         self.count     = 0
         self.nan_count = 0
         self.fr_count  = 0
         self._stop     = threading.Event()  # for orderly shutdown from another thread
+        if hopper is _DEFAULT_HOPPER:
+            self.hopper = None if channel is not None else \
+                ChannelHopper(iface, channels_up_to(max_channel), channel_dwell)
+            self.role = role or ("fixed" if channel is not None else "legacy")
+        else:
+            self.hopper = hopper
+            self.role = role or ("fixed" if hopper is None else "scan")
+
+    def _tuned_channel(self) -> int | None:
+        if self.hopper is not None:
+            return getattr(self.hopper, "current_channel", None)
+        return self.channel
+
+    def _heard(self, channel: int | None) -> None:
+        """A decoded Remote ID frame landed. The hopper may camp on it."""
+        hopper = self.hopper
+        if hopper is None or not hasattr(hopper, "notify_detection"):
+            return
+        hopper.notify_detection(channel if channel is not None else self._tuned_channel())
+
+    def status(self) -> dict:
+        """A few integers for /status. No scanning, no locks worth taking."""
+        hopper = self.hopper
+        channel = self._tuned_channel()
+        camp = getattr(hopper, "camp_channel", None) if hopper is not None else None
+        plan = getattr(hopper, "plan_name", self.role) if hopper is not None else self.role
+        sweep = getattr(hopper, "sweep_s", None) if hopper is not None else None
+        targets = None
+        if hopper is not None:
+            targets = getattr(hopper, "target_channels", None)
+            if targets is None and hasattr(hopper, "channels"):
+                targets = hopper.channels
+        return {
+            "iface":    self.iface,
+            "role":     self.role,
+            "plan":     plan,
+            "channel":  channel,
+            "camping":  camp,
+            "channels": None if targets is None else len(list(targets)),
+            "sweep_s":  None if sweep is None else round(float(sweep), 1),
+        }
 
     def _on_packet(self, data: bytes):
-        rt_len, rssi = _parse_radiotap(data)
+        rt_len, rssi, channel = _parse_radiotap(data)
         if rt_len >= len(data):
             return
+        if channel is None:
+            channel = self._tuned_channel()
 
         mac_data = data[rt_len:]
         header = _parse_dot11_mgmt(mac_data)
@@ -828,7 +922,7 @@ class WiFiFeeder:
             if rid_payload is None:
                 frdid = _extract_beacon_frdid(body)
                 if frdid is not None:
-                    self._on_frdid(addr2, frdid, rssi)
+                    self._on_frdid(addr2, frdid, rssi, channel)
                 return
 
             decoded = decode_rid_message(rid_payload)
@@ -873,9 +967,10 @@ class WiFiFeeder:
                     else:
                         detail = ""
                     log.info(
-                        f"[WiFi-Beacon] MAC={addr2}  RSSI={rssi}dBm  "
+                        f"[WiFi-Beacon] ch{channel}  MAC={addr2}  RSSI={rssi}dBm  "
                         f"Type={mtype}  {detail}"
                     )
+            self._heard(channel)
             return
 
         # ---- Wi-Fi NAN Remote ID (subtype 13 — action frame) ----
@@ -889,7 +984,7 @@ class WiFiFeeder:
                 # NAN-broadcasting drone shows up and our spec interpretation
                 # is slightly off, we have hex evidence to fix the parser.
                 log.warning(
-                    f"[WiFi-NAN] MAC={addr2}  RSSI={rssi}dBm  "
+                    f"[WiFi-NAN] ch{channel}  MAC={addr2}  RSSI={rssi}dBm  "
                     f"matched NAN Service ID but SDA didn't parse; "
                     f"body[:80]={body.hex().upper()[:160]}"
                 )
@@ -936,11 +1031,12 @@ class WiFiFeeder:
                     else:
                         detail = ""
                     log.info(
-                        f"[WiFi-NAN] MAC={addr2}  RSSI={rssi}dBm  "
+                        f"[WiFi-NAN] ch{channel}  MAC={addr2}  RSSI={rssi}dBm  "
                         f"Type={mtype}  {detail}"
                     )
+            self._heard(channel)
 
-    def _on_frdid(self, mac: str, payload: bytes, rssi) -> None:
+    def _on_frdid(self, mac: str, payload: bytes, rssi, channel: int | None = None) -> None:
         """Handle a French Direct Remote ID beacon.
 
         One beacon carries identity, position and takeoff point together, so
@@ -979,10 +1075,11 @@ class WiFiFeeder:
         if self.tracker is not None:
             for mtype, msg in messages:
                 self._update_tracker(mac, mtype, msg, rssi, rid_source="wifi_beacon_fr")
+        self._heard(channel)
 
         position = f"lat={fr['latitude']} lon={fr['longitude']}" if "latitude" in fr else "no position"
         log.info(
-            f"[WiFi-FR] MAC={mac}  RSSI={rssi}dBm  "
+            f"[WiFi-FR] ch{channel}  MAC={mac}  RSSI={rssi}dBm  "
             f"UAS-ID={messages[0][1]['uas_id']}  {position}"
         )
 
@@ -1032,20 +1129,31 @@ class WiFiFeeder:
             )
 
     def _heartbeat_loop(self):
-        while True:
-            time.sleep(60)
-            log.info(f"[Heartbeat] Beacon RID={self.count}  NAN={self.nan_count}  FR={self.fr_count}")
+        while not self._stop.wait(60):
+            plan = getattr(self.hopper, "plan_name", self.role) if self.hopper else self.role
+            log.info(
+                f"[Heartbeat] {self.iface} plan={plan} ch{self._tuned_channel()}  "
+                f"Beacon RID={self.count}  NAN={self.nan_count}  FR={self.fr_count}"
+            )
 
     def stop(self) -> None:
         """Signal run() to exit; restore_managed_mode() runs in the finally."""
         self._stop.set()
 
     def run(self):
-        log.info(f"dump3411 WiFi detector — interface {self.iface}")
+        try:
+            self._capture()
+        except Exception:
+            log.exception("Wi-Fi feeder %s crashed", self.iface)
+
+    def _capture(self):
+        log.info(f"dump3411 WiFi detector — {self.iface} ({self.role})")
 
         set_monitor_mode(self.iface)
         if self.hopper is not None:
-            log.info(f"Channels: {self.hopper.channels}")
+            channels = getattr(self.hopper, "channels", None)
+            if channels is not None:
+                log.info(f"Channels: {channels}")
             self.hopper.start()
         else:
             log.info(f"Fixed channel: {self.channel} (hopping disabled)")
@@ -1083,17 +1191,234 @@ def _handle_sigterm(signum, frame):
     raise KeyboardInterrupt
 
 
+# -- Adapter discovery ---------------------------------------------------------
+
+def _is_onboard(iface: str) -> bool:
+    """Pi onboard Wi-Fi (brcmfmac, or an SDIO/MMC bus). Never put that in monitor mode."""
+    try:
+        driver = os.path.basename(os.readlink(f"/sys/class/net/{iface}/device/driver"))
+    except OSError:
+        driver = ""
+    if driver == "brcmfmac":
+        return True
+    try:
+        bus = os.path.basename(os.readlink(f"/sys/class/net/{iface}/device/subsystem"))
+    except OSError:
+        bus = ""
+    return bus in ("sdio", "mmc")
+
+
+def _phy_info(iface: str) -> str | None:
+    try:
+        info = subprocess.run(
+            ["iw", "dev", iface, "info"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    phy = None
+    for line in info.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("wiphy "):
+            phy = stripped.split()[-1]
+            break
+    if phy is None:
+        return None
+    try:
+        phyinfo = subprocess.run(
+            ["iw", "phy", f"phy{phy}", "info"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if phyinfo.returncode != 0 and not phyinfo.stdout:
+        return None
+    return phyinfo.stdout
+
+
+def _channels_and_bands(iw_info: str) -> tuple[frozenset[int], tuple[str, ...]]:
+    """Enabled channel numbers, plus band capability (disabled channels still count
+    as a band — the question there is what the silicon can do)."""
+    channels: set[int] = set()
+    bands: set[str] = set()
+    for line in iw_info.splitlines():
+        match = re.search(r"(\d{4})(?:\.\d+)?\s+MHz\s+\[(\d+)\]", line)
+        if not match:
+            continue
+        freq = int(match.group(1))
+        if 2400 <= freq <= 2500:
+            bands.add("2.4")
+        elif 5000 <= freq <= 5900:
+            bands.add("5")
+        if "disabled" in line:
+            continue
+        channels.add(int(match.group(2)))
+    return frozenset(channels), tuple(sorted(bands))
+
+
+def probe_adapter(iface: str, *, backhaul: str | None = None):
+    """Build a scan_plan.Adapter from sysfs + iw. Probe failure leaves
+    ``probed=False`` so the caller can still try the interface the user named."""
+    from scan_plan import Adapter
+
+    mac = _get_iface_mac(iface) or ""
+    onboard = _is_onboard(iface)
+    is_backhaul = bool(backhaul and iface == backhaul)
+    info = _phy_info(iface)
+    if info is None:
+        log.warning("Could not read PHY info for %s — band detection unavailable", iface)
+        return Adapter(
+            iface=iface, mac=mac, monitor=True, onboard=onboard,
+            backhaul=is_backhaul, supported=None, probed=False,
+        )
+    channels, bands = _channels_and_bands(info)
+    monitor = bool(re.search(r"^\s*\*\s+monitor\s*$", info, re.MULTILINE))
+    return Adapter(
+        iface=iface, mac=mac, bands=bands, monitor=monitor, onboard=onboard,
+        backhaul=is_backhaul, supported=channels, probed=True,
+    )
+
+
+def enumerate_adapters() -> list:
+    backhaul = _get_backhaul_iface()
+    try:
+        names = os.listdir("/sys/class/net")
+    except OSError:
+        return []
+    ifaces = sorted(name for name in names if name.startswith(("wlan", "wlx")))
+    return [probe_adapter(iface, backhaul=backhaul) for iface in ifaces]
+
+
+def resolve_adapters(ifaces: list[str]) -> list:
+    if len(ifaces) == 1 and ifaces[0] == "auto":
+        return enumerate_adapters()
+    backhaul = _get_backhaul_iface()
+    return [probe_adapter(iface, backhaul=backhaul) for iface in ifaces]
+
+
+def _skip_reason(adapter) -> str | None:
+    if adapter.onboard:
+        return "it is the Pi onboard radio"
+    if adapter.backhaul:
+        return "it is carrying the network connection"
+    if not adapter.monitor:
+        return "it does not advertise monitor mode"
+    return None
+
+
+def build_feeders(
+    ifaces: list[str],
+    *,
+    verbose: bool = False,
+    channel: int | None = None,
+    channel_dwell: float = 0.2,
+    max_channel: int = CHANNELS_24[-1],
+    tracker=None,
+    scan_plan: str = "auto",
+) -> list[WiFiFeeder]:
+    """One WiFiFeeder per radio the scan plan assigns.
+
+    ``ifaces`` is interface names, or ``["auto"]`` to take every USB monitor
+    adapter that is not the backhaul. Raises RuntimeError when nothing usable
+    is plugged in, ValueError when ``--channel`` is combined with more than
+    one radio.
+    """
+    from scan_plan import BandHopper, assign_roles, describe, forecast
+
+    if channel is not None:
+        if len(ifaces) != 1 or ifaces[0] == "auto":
+            raise ValueError("--channel pins one radio; pass a single --wifi-iface")
+        return [WiFiFeeder(
+            iface=ifaces[0], verbose=verbose, channel=channel,
+            max_channel=max_channel, tracker=tracker,
+        )]
+
+    adapters = resolve_adapters(ifaces)
+    for adapter in adapters:
+        reason = _skip_reason(adapter)
+        if reason:
+            log.info("Not using %s: %s", adapter.iface, reason)
+    assignments = assign_roles(adapters, scan_plan=scan_plan, max_channel=max_channel)
+    active = [item for item in assignments if item.role != "unused"]
+    if not active:
+        raise RuntimeError(
+            "No monitor-capable USB Wi-Fi adapter found. Plug one in "
+            "(not the interface carrying your network) and retry."
+        )
+    for item in assignments:
+        if item.role == "unused" and item.note:
+            log.info("Leaving %s unused: %s", item.iface, item.note)
+        elif item.note and item.role == "legacy":
+            log.info("%s: %s", item.iface, item.note)
+    log.info("Wi-Fi plan: %s", describe(assignments))
+    note = forecast(assignments)
+    if note:
+        log.info(note)
+
+    macs = [item.mac for item in active if item.mac]
+    if macs:
+        _set_nm_unmanaged(macs)
+
+    feeders: list[WiFiFeeder] = []
+    for item in active:
+        if item.spec is not None:
+            hopper = BandHopper(item.iface, item.spec, tune=set_channel)
+            feeders.append(WiFiFeeder(
+                iface=item.iface, verbose=verbose, tracker=tracker,
+                hopper=hopper, role=item.role,
+            ))
+        else:
+            feeders.append(WiFiFeeder(
+                iface=item.iface, verbose=verbose, tracker=tracker,
+                channel_dwell=channel_dwell, max_channel=max_channel,
+                role="legacy",
+            ))
+    return feeders
+
+
+def _serve_feeders(feeders: list[WiFiFeeder]) -> None:
+    """Block until the feeders stop. One radio runs on this thread so SIGTERM
+    still lands in its finally; several radios each get a thread."""
+    if len(feeders) == 1:
+        feeders[0].run()
+        return
+    threads = []
+    for feeder in feeders:
+        thread = threading.Thread(
+            target=feeder.run, daemon=True, name=f"wifi-{feeder.iface}",
+        )
+        thread.start()
+        threads.append(thread)
+    try:
+        while any(thread.is_alive() for thread in threads):
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        log.info("Stopped.")
+    finally:
+        for feeder in feeders:
+            feeder.stop()
+        time.sleep(1.5)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="dump3411 WiFi Remote ID detector (offline)"
     )
     parser.add_argument(
-        "--iface", default="wlan1",
-        help="Monitor-mode interface — the USB adapter (default: wlan1)"
+        "--iface", action="append", default=None,
+        help="Monitor-mode interface. Repeat for each adapter, or pass 'auto' "
+             "to use every USB monitor adapter except the one carrying your "
+             "network (default: wlan1)",
+    )
+    parser.add_argument(
+        "--scan-plan", choices=["auto", "legacy"], default="auto",
+        help="auto: social-weighted sweep, splitting bands across adapters. "
+             "legacy: flat 2.4 GHz hop on one radio (default: auto)",
     )
     parser.add_argument(
         "--channel-dwell", type=float, default=0.2,
-        help="Seconds to dwell on each channel before hopping (default: 0.2)"
+        help="Seconds per channel in the legacy hop (default: 0.2). Ignored by "
+             "the social-weighted plans."
     )
     parser.add_argument(
         "--channel", type=int, default=None, metavar="CH",
@@ -1115,14 +1440,19 @@ def main():
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
 
-    feeder = WiFiFeeder(
-        iface=args.iface,
-        verbose=args.verbose,
-        channel_dwell=args.channel_dwell,
-        channel=args.channel,
-        max_channel=args.max_channel,
-    )
-    feeder.run()
+    ifaces = args.iface or ["wlan1"]
+    try:
+        feeders = build_feeders(
+            ifaces,
+            verbose=args.verbose,
+            channel_dwell=args.channel_dwell,
+            channel=args.channel,
+            max_channel=args.max_channel,
+            scan_plan=args.scan_plan,
+        )
+    except (RuntimeError, ValueError) as exc:
+        parser.error(str(exc))
+    _serve_feeders(feeders)
 
 
 if __name__ == "__main__":

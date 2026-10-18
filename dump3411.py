@@ -2,12 +2,16 @@
 """
 dump3411 / dump3411.py
 
-Single-process orchestrator. Runs both radios (BLE + WiFi) as daemon threads
-feeding one shared in-memory ``Tracker``, plus a stdlib HTTP server that
-serves the tracker snapshot at ``/data/remoteid.json``. See FEED.md.
+Single-process orchestrator. Runs BLE and one or more Wi-Fi radios as
+daemon threads feeding one shared in-memory ``Tracker``, plus a stdlib HTTP
+server that serves the tracker snapshot at ``/data/remoteid.json``. See FEED.md.
+
+``--wifi-iface auto`` uses every USB monitor adapter except the one carrying
+the network. Two adapters split 2.4 and 5 GHz; further dual-band adapters
+split the 5 GHz list.
 
 Usage:
-    sudo python3 dump3411.py --wifi-iface wlan1 --serve 0.0.0.0:8754
+    sudo python3 dump3411.py --wifi-iface auto --serve 0.0.0.0:8754
 
 The ``--serve`` flag is optional. Without it the process detects-and-journals
 exactly like the standalone feeders but maintains the in-memory cache too —
@@ -30,7 +34,7 @@ from typing import Tuple
 import feed_server
 from ble_feeder import BLEFeeder
 from tracker import Tracker
-from wifi_feeder import CHANNELS_24, MAX_CHANNEL_CHOICES, WiFiFeeder
+from wifi_feeder import CHANNELS_24, MAX_CHANNEL_CHOICES, build_feeders
 from version import get_version
 
 # Logging is configured (root) by the feeder modules at import time; reuse it.
@@ -48,6 +52,14 @@ def _parse_addr(s: str) -> Tuple[str, int]:
     return (host or "0.0.0.0"), int(port_str)
 
 
+def _wifi_ifaces(args: argparse.Namespace) -> list[str]:
+    """Interfaces from ``--wifi-iface`` (repeatable), else ``$WIFI_IFACES``, else wlan1."""
+    if args.wifi_iface:
+        return args.wifi_iface
+    env = os.environ.get("WIFI_IFACES", "").replace(",", " ").split()
+    return env or ["wlan1"]
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="dump3411 unified Remote ID detector + JSON feed (offline)",
@@ -57,12 +69,22 @@ def _parse_args() -> argparse.Namespace:
         help="HCI adapter for BLE scan (default: hci0)",
     )
     p.add_argument(
-        "--wifi-iface", default="wlan1",
-        help="USB monitor-mode interface for WiFi capture (default: wlan1)",
+        "--wifi-iface", action="append", default=None,
+        help="USB monitor-mode interface. Repeat for each adapter, or pass "
+             "'auto' to use every USB monitor adapter except the backhaul. "
+             "Default: $WIFI_IFACES, or wlan1.",
+    )
+    p.add_argument(
+        "--scan-plan", choices=["auto", "legacy"],
+        default=os.environ.get("WIFI_SCAN_PLAN", "auto"),
+        help="auto: social-weighted sweep, splitting bands across adapters. "
+             "legacy: flat 2.4 GHz hop on one radio (default: auto). "
+             "Also read from $WIFI_SCAN_PLAN.",
     )
     p.add_argument(
         "--channel-dwell", type=float, default=0.2,
-        help="Seconds per channel before WiFi hopper moves on (default: 0.2)",
+        help="Seconds per channel in the legacy 2.4 GHz hop (default: 0.2). "
+             "Ignored by the social-weighted plans.",
     )
     p.add_argument(
         "--channel", type=int, default=None, metavar="CH",
@@ -146,6 +168,9 @@ def _parse_args() -> argparse.Namespace:
     args = p.parse_args()
     if args.channel is not None and not 1 <= args.channel <= args.max_channel:
         p.error(f"--channel must be 1-{args.max_channel} (raise --max-channel for 12-13)")
+    ifaces = _wifi_ifaces(args)
+    if args.channel is not None and (len(ifaces) != 1 or ifaces[0] == "auto"):
+        p.error("--channel pins one radio; pass a single --wifi-iface")
     return args
 
 
@@ -222,17 +247,28 @@ def main() -> None:
             on_expire=_fan_expire if on_expire_sinks else None,
         )
 
-    ble  = BLEFeeder(adapter=args.ble_adapter, verbose=args.verbose,
-                     tracker=tracker)
-    wifi = WiFiFeeder(iface=args.wifi_iface, verbose=args.verbose,
-                      channel_dwell=args.channel_dwell, channel=args.channel,
-                      max_channel=args.max_channel, tracker=tracker)
+    ble = BLEFeeder(adapter=args.ble_adapter, verbose=args.verbose,
+                    tracker=tracker)
+    try:
+        wifis = build_feeders(
+            _wifi_ifaces(args),
+            verbose=args.verbose,
+            channel=args.channel,
+            channel_dwell=args.channel_dwell,
+            max_channel=args.max_channel,
+            tracker=tracker,
+            scan_plan=args.scan_plan,
+        )
+    except (RuntimeError, ValueError) as exc:
+        log.error("%s", exc)
+        sys.exit(1)
 
     # Daemon threads: radios produce, sweeper expires stale entries.
     threading.Thread(target=lambda: asyncio.run(ble.run()),
                      daemon=True, name="ble").start()
-    threading.Thread(target=wifi.run,
-                     daemon=True, name="wifi").start()
+    for wifi in wifis:
+        threading.Thread(target=wifi.run, daemon=True,
+                         name=f"wifi-{wifi.iface}").start()
     threading.Thread(target=tracker.sweep_loop,
                      daemon=True, name="sweeper").start()
 
@@ -242,7 +278,8 @@ def main() -> None:
     server   = None
     if args.serve:
         host, port = _parse_addr(args.serve)
-        server = feed_server.make_server((host, port), tracker, history=history)
+        server = feed_server.make_server((host, port), tracker, history=history,
+                                          radios=wifis)
         log.info(f"feed listening on http://{host}:{port}/data/remoteid.json")
         if history is not None:
             log.info(f"history at {args.history_db}; map view: "
@@ -272,7 +309,8 @@ def main() -> None:
             while not shutdown.wait(1.0):
                 pass
     finally:
-        wifi.stop()
+        for wifi in wifis:
+            wifi.stop()
         tracker.stop()
         if publisher is not None:
             publisher.stop()
@@ -280,7 +318,7 @@ def main() -> None:
             history.stop()
         # Wifi cleanup (restore_managed_mode) runs in its thread's finally.
         # Give it a moment before the process exits and kills daemon threads.
-        time.sleep(1.5)
+        time.sleep(max(1.5, 0.6 * len(wifis)))
         if server is not None:
             server.server_close()
         log.info("dump3411 exiting")

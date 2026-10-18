@@ -5,7 +5,8 @@
 # For boot-time autostart use the systemd unit instead — see README.md.
 #
 # Usage:
-#   sudo ./run-offline.sh [wifi-interface]      # default: wlan1
+#   sudo ./run-offline.sh [wifi-interface|auto]  # default: wlan1
+#   sudo ./run-offline.sh auto                   # every USB monitor adapter
 set -u
 
 WIFI_IFACE="${1:-wlan1}"
@@ -13,7 +14,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ $EUID -ne 0 ]]; then
     echo "Must run as root (raw sockets, monitor mode, Bluetooth)." >&2
-    echo "Usage: sudo $0 [wifi-interface]   (default: wlan1)" >&2
+    echo "Usage: sudo $0 [wifi-interface|auto]   (default: wlan1)" >&2
     exit 1
 fi
 
